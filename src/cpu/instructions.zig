@@ -7,6 +7,7 @@ const std = @import("std");
 const cpu_mod = @import("cpu.zig");
 const Cpu = cpu_mod.Cpu;
 const CpuError = cpu_mod.CpuError;
+const Flags = cpu_mod.Flags;
 
 /// ModR/M byte decoding result
 const ModRM = struct {
@@ -623,6 +624,31 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
         0xCD => {
             const vector = try fetchByte(cpu);
             try handleInterrupt(cpu, vector);
+        },
+
+        // IRET/IRETD - Return from interrupt
+        0xCF => {
+            // Pop EIP, CS, EFLAGS from stack (in that order)
+            // Handle both 16-bit (IRET) and 32-bit (IRETD) based on operand size
+            if (cpu.prefix.operand_size_override) {
+                // 16-bit: pop IP, CS, FLAGS
+                const new_ip = try cpu.pop16();
+                const new_cs = try cpu.pop16();
+                const new_flags = try cpu.pop16();
+
+                cpu.eip = new_ip;
+                cpu.segments.cs = new_cs;
+                cpu.flags.fromU32(@as(u32, new_flags));
+            } else {
+                // 32-bit: pop EIP, CS, EFLAGS
+                const new_eip = try cpu.pop();
+                const new_cs_u32 = try cpu.pop();
+                const new_eflags = try cpu.pop();
+
+                cpu.eip = new_eip;
+                cpu.segments.cs = @truncate(new_cs_u32);
+                cpu.flags.fromU32(new_eflags);
+            }
         },
 
         // IN AL, imm8
@@ -2088,19 +2114,8 @@ fn setCC(cpu: *Cpu, condition: bool) !void {
 }
 
 fn handleInterrupt(cpu: *Cpu, vector: u8) !void {
-    // Simplified interrupt handling - just push flags, CS, IP
-    try cpu.push(cpu.flags.toU32());
-    try cpu.push16(cpu.segments.cs);
-    try cpu.push(@truncate(cpu.eip));
-
-    // For now, just use a simple IVT lookup (real mode style)
-    const ivt_addr = @as(u32, vector) * 4;
-    const new_ip = try cpu.readMemWord(ivt_addr);
-    const new_cs = try cpu.readMemWord(ivt_addr + 2);
-
-    cpu.segments.cs = new_cs;
-    cpu.eip = new_ip;
-    cpu.flags.interrupt = false;
+    // Dispatch interrupt through IDT (protected mode) or IVT (real mode)
+    try cpu.dispatchInterrupt(vector);
 }
 
 // Tests

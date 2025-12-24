@@ -955,3 +955,142 @@ test "integration: bsf bsr" {
     try std.testing.expect(output != null);
     try std.testing.expectEqualStrings("B", output.?);
 }
+
+// Test: INT 0x80 with IRET in protected mode
+test "integration: int 0x80 with iret" {
+    const allocator = std.testing.allocator;
+
+    // Memory layout:
+    // 0x0000 - 0x0FFF: Main code
+    // 0x1000 - 0x1FFF: GDT
+    // 0x2000 - 0x2FFF: IDT
+    // 0x3000 - 0x3FFF: Interrupt handler code
+
+    // GDT at 0x1000
+    const gdt = [_]u8{
+        // Entry 0: Null descriptor
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // Entry 1: Code segment (0x08)
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00,
+        // Entry 2: Data segment (0x10)
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00,
+    };
+
+    // GDTR structure at 0x0FF6
+    const gdtr = [_]u8{
+        0x17, 0x00, // limit = 23 (3 entries * 8 - 1)
+        0x00, 0x10, 0x00, 0x00, // base = 0x1000
+    };
+
+    // IDT at 0x2000 - set up entry for interrupt 0x80
+    // IDT entry format: offset_low (2), selector (2), reserved (1), type_attr (1), offset_high (2)
+    // Handler at 0x3000, selector 0x08 (code segment), 32-bit interrupt gate
+    // type_attr: present=1, DPL=0, gate_type=0xE (interrupt gate)
+    // type_attr byte: 10001110 = 0x8E
+    var idt: [2048]u8 = undefined;
+    @memset(&idt, 0);
+
+    // Entry for vector 0x80 at offset 0x80 * 8 = 0x400
+    const handler_offset: u32 = 0x3000;
+    const selector: u16 = 0x08;
+    const type_attr: u8 = 0x8E; // Present, DPL=0, 32-bit interrupt gate
+
+    idt[0x400 + 0] = @truncate(handler_offset); // offset_low low byte
+    idt[0x400 + 1] = @truncate(handler_offset >> 8); // offset_low high byte
+    idt[0x400 + 2] = @truncate(selector); // selector low byte
+    idt[0x400 + 3] = @truncate(selector >> 8); // selector high byte
+    idt[0x400 + 4] = 0; // reserved
+    idt[0x400 + 5] = type_attr; // type_attr
+    idt[0x400 + 6] = @truncate(handler_offset >> 16); // offset_high low byte
+    idt[0x400 + 7] = @truncate(handler_offset >> 24); // offset_high high byte
+
+    // IDTR structure at 0x0FE6
+    const idtr = [_]u8{
+        0xFF, 0x07, // limit = 2047 (256 entries * 8 - 1)
+        0x00, 0x20, 0x00, 0x00, // base = 0x2000
+    };
+
+    // Interrupt handler at 0x3000
+    // Outputs 'I' to UART and executes IRET
+    const handler = [_]u8{
+        // mov edx, 0x3F8
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        // mov al, 'I'
+        0xB0, 'I',
+        // out dx, al
+        0xEE,
+        // iret
+        0xCF,
+    };
+
+    // Main code at 0x0000
+    const code = [_]u8{
+        // Setup stack
+        // mov esp, 0x8000
+        0xBC, 0x00, 0x80, 0x00, 0x00,
+
+        // Load GDT
+        // lgdt [0x0FF6]
+        0x0F, 0x01, 0x15, 0xF6, 0x0F, 0x00, 0x00,
+
+        // Load IDT
+        // lidt [0x0FE6]
+        0x0F, 0x01, 0x1D, 0xE6, 0x0F, 0x00, 0x00,
+
+        // Enable protected mode
+        // mov eax, cr0
+        0x0F, 0x20, 0xC0,
+        // or al, 1
+        0x0C, 0x01,
+        // mov cr0, eax
+        0x0F, 0x22, 0xC0,
+
+        // Now in protected mode, execute INT 0x80
+        // int 0x80
+        0xCD, 0x80,
+
+        // After returning from interrupt, output 'R'
+        // mov edx, 0x3F8
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        // mov al, 'R'
+        0xB0, 'R',
+        // out dx, al
+        0xEE,
+
+        // hlt
+        0xF4,
+    };
+
+    var emu = try Emulator.init(allocator, .{
+        .memory_size = 1024 * 1024,
+        .enable_uart = true,
+    });
+    defer emu.deinit();
+
+    // Load GDT at 0x1000
+    try emu.loadBinary(&gdt, 0x1000);
+    // Load GDTR at 0x0FF6
+    try emu.loadBinary(&gdtr, 0x0FF6);
+    // Load IDT at 0x2000
+    try emu.loadBinary(&idt, 0x2000);
+    // Load IDTR at 0x0FE6
+    try emu.loadBinary(&idtr, 0x0FE6);
+    // Load interrupt handler at 0x3000
+    try emu.loadBinary(&handler, 0x3000);
+    // Load main code at 0x0000
+    try emu.loadBinary(&code, 0x0000);
+
+    // Run with cycle limit
+    var cycles: usize = 0;
+    while (!emu.cpu_instance.isHalted() and cycles < 200) : (cycles += 1) {
+        try emu.step();
+    }
+
+    // Verify protected mode was entered
+    try std.testing.expect(emu.cpu_instance.mode == .protected);
+
+    // Verify UART output is "IR" - 'I' from interrupt handler, 'R' from main code after return
+    const output = emu.getUartOutput();
+    try std.testing.expect(output != null);
+    try std.testing.expectEqualStrings("IR", output.?);
+}

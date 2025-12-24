@@ -564,6 +564,62 @@ pub const Cpu = struct {
     pub fn halt(self: *Self) void {
         self.halted = true;
     }
+
+    /// Dispatch interrupt through IDT (protected mode) or IVT (real mode)
+    pub fn dispatchInterrupt(self: *Self, vector: u8) !void {
+        if (self.mode == .protected) {
+            // Protected mode: use IDT
+            const offset = @as(u32, vector) * 8;
+
+            // Check if interrupt descriptor is within IDT limit
+            if (offset + 7 > self.system.idtr.limit) {
+                return CpuError.GeneralProtectionFault;
+            }
+
+            // Read 8-byte gate descriptor from IDT
+            var bytes: [8]u8 = undefined;
+            for (0..8) |i| {
+                bytes[i] = try self.mem.readByte(self.system.idtr.base + offset + @as(u32, @intCast(i)));
+            }
+
+            const gate = protected_mode.GateDescriptor.fromBytes(bytes);
+
+            // Check if gate is present
+            if (!gate.isPresent()) {
+                return CpuError.GeneralProtectionFault;
+            }
+
+            // Push EFLAGS, CS, EIP
+            try self.push(self.flags.toU32());
+            try self.push16(self.segments.cs);
+            try self.push(self.eip);
+
+            // Load new CS:EIP from gate descriptor
+            self.segments.cs = gate.selector;
+            self.eip = gate.getOffset();
+
+            // Clear IF flag for interrupt gates (not for trap gates)
+            if (gate.isInterruptGate()) {
+                self.flags.interrupt = false;
+            }
+        } else {
+            // Real mode: use IVT at fixed location 0x00000000
+            const vector_addr = @as(u32, vector) * 4;
+
+            // Push flags, CS, IP
+            try self.push(self.flags.toU32());
+            try self.push16(self.segments.cs);
+            try self.push(@truncate(self.eip));
+
+            // Read new IP and CS from IVT
+            const new_ip = try self.mem.readWord(vector_addr);
+            const new_cs = try self.mem.readWord(vector_addr + 2);
+
+            self.eip = new_ip;
+            self.segments.cs = new_cs;
+            self.flags.interrupt = false;
+        }
+    }
 };
 
 // Tests
