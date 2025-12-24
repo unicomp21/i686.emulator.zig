@@ -109,7 +109,7 @@ All tests currently pass (100+):
 | I/O (via root) | 6 | ✓ Pass |
 | Keyboard | 10 | ✓ Pass |
 | Protected Mode | 8 | ✓ Pass |
-| Instructions | 8 | ✓ Pass |
+| Instructions | 13 | ✓ Pass |
 | Integration | 22 | ✓ Pass |
 
 ### Test Categories
@@ -220,6 +220,7 @@ Core CPU emulation:
 
 Implemented instruction groups:
 - **Data Movement**: MOV, LEA, PUSH, POP, MOVZX, MOVSX, XCHG, LAHF, SAHF
+- **Segment Loading**: LES, LDS, LSS, LFS, LGS (load far pointers with segment:offset)
 - **Arithmetic**: ADD, SUB, INC, DEC, CMP, MUL, IMUL, DIV, IDIV, NEG, CBW/CWDE, CWD/CDQ
 - **Logic**: XOR, AND, OR, NOT, TEST
 - **Shift/Rotate**: SHL, SHR, SAR, ROL, ROR, RCL, RCR
@@ -228,7 +229,7 @@ Implemented instruction groups:
 - **Control Flow**: JMP, Jcc, CALL, RET, INT, LEAVE
 - **Stack/Flags**: PUSHF, POPF, PUSHA, POPA
 - **I/O**: IN, OUT
-- **System**: NOP, HLT, CLI, STI, CLD, STD
+- **System**: NOP, HLT, CLI, STI, CLD, STD, SLDT, STR, LLDT, LTR, VERR, VERW
 - **Special**: CPUID, RDTSC
 
 ### Memory (`src/memory/memory.zig`)
@@ -488,6 +489,8 @@ The long-term goal is running Linux kernel self-tests. Current progress:
 | Paging | ✓ Done | 4KB pages, identity mapping, CR3/PG support |
 | System calls | ✓ Done | INT 0x80 with IRET, SYSENTER/SYSEXIT |
 | MSR support | ✓ Done | RDMSR/WRMSR for SYSENTER registers |
+| Segment loading | ✓ Done | LES, LDS, LSS, LFS, LGS far pointers |
+| Descriptor table | ✓ Done | SLDT, STR, LLDT, LTR, VERR, VERW |
 | Full instruction set | ☐ TODO | ~150 more opcodes |
 
 ### Protected Mode Support
@@ -543,25 +546,16 @@ Page table structure (set up in physical memory before enabling):
 
 ### Priority Features for kselftest
 
-1. **More System Instructions**
-   - SYSENTER/SYSEXIT
-   - LLDT, LTR (task register)
-   - IRET (interrupt return)
-
-2. **Interrupts & Exceptions**
-   - IDT-based interrupt dispatch
+1. **Interrupts & Exceptions**
+   - IDT-based interrupt dispatch (partially done)
    - Hardware interrupt simulation
    - Exception handling (#GP, #PF, #UD, etc.)
 
-3. **Additional I/O**
-   - PIC (8259) emulation
-   - PIT (8254) timer emulation
-   - Keyboard controller (8042)
-
-4. **More Instructions**
-   - LEA, MOVZX, MOVSX
-   - Shift/rotate (SHL, SHR, ROL, ROR)
-   - String operations (REP MOVS, STOS, etc.)
+2. **More Instructions**
+   - CMOVcc (conditional move)
+   - XADD, CMPXCHG (atomic operations)
+   - Additional x87 FPU instructions
+   - SSE/MMX instructions (if needed)
 
 ## Performance Considerations
 
