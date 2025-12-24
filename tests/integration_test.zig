@@ -820,3 +820,138 @@ test "integration: pushf popf" {
     try std.testing.expect(output != null);
     try std.testing.expectEqualStrings("P", output.?);
 }
+
+// Test: REP MOVSB - String copy with REP prefix
+test "integration: rep movsb" {
+    const allocator = std.testing.allocator;
+
+    // Test REP MOVSB to copy a string from one location to another
+    // Source string "HELLO" at 0x1000, copy to 0x2000
+    const source_string = "HELLO";
+
+    // Code to copy string using REP MOVSB
+    const code = [_]u8{
+        // Set up source and destination pointers
+        // mov esi, 0x1000 - BE 00 10 00 00
+        0xBE, 0x00, 0x10, 0x00, 0x00,
+        // mov edi, 0x2000 - BF 00 20 00 00
+        0xBF, 0x00, 0x20, 0x00, 0x00,
+        // mov ecx, 5 (length of "HELLO") - B9 05 00 00 00
+        0xB9, 0x05, 0x00, 0x00, 0x00,
+        // cld (clear direction flag - forward copy) - FC
+        0xFC,
+        // rep movsb - F3 A4
+        0xF3, 0xA4,
+
+        // Now output the copied string via UART
+        // mov esi, 0x2000 - BE 00 20 00 00
+        0xBE, 0x00, 0x20, 0x00, 0x00,
+        // mov ecx, 5 - B9 05 00 00 00
+        0xB9, 0x05, 0x00, 0x00, 0x00,
+        // mov edx, 0x3F8 - BA F8 03 00 00
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+
+        // loop_output: (offset 30)
+        // lodsb - AC (load byte from [ESI] into AL, increment ESI)
+        0xAC,
+        // out dx, al - EE
+        0xEE,
+        // dec ecx - 49
+        0x49,
+        // jnz loop_output (-5 bytes) - 75 FB
+        0x75, 0xFB,
+
+        // hlt - F4
+        0xF4,
+    };
+
+    var emu = try Emulator.init(allocator, .{
+        .memory_size = 1024 * 1024,
+        .enable_uart = true,
+    });
+    defer emu.deinit();
+
+    // Load source string at 0x1000
+    try emu.loadBinary(source_string, 0x1000);
+    // Load code at 0x0000
+    try emu.loadBinary(&code, 0x0000);
+
+    // Run with cycle limit to prevent infinite loops
+    var cycles: usize = 0;
+    while (!emu.cpu_instance.isHalted() and cycles < 1000) : (cycles += 1) {
+        try emu.step();
+    }
+
+    // Verify the string was copied and output correctly
+    const output = emu.getUartOutput();
+    try std.testing.expect(output != null);
+    try std.testing.expectEqualStrings("HELLO", output.?);
+}
+
+// Test: BSF and BSR instructions
+test "integration: bsf bsr" {
+    const allocator = std.testing.allocator;
+
+    // Test BSF (bit scan forward) and BSR (bit scan reverse)
+    const code = [_]u8{
+        // Test BSF with value 0x00000120 (bits 5 and 8 set)
+        // Expected: BSF finds bit 5 (lowest set bit)
+        // mov eax, 0x120 - B8 20 01 00 00
+        0xB8, 0x20, 0x01, 0x00, 0x00,
+        // bsf ebx, eax - 0F BC D8
+        0x0F, 0xBC, 0xD8,
+        // cmp ebx, 5 - 83 FB 05
+        0x83, 0xFB, 0x05,
+        // jne fail
+        0x75, 0x23,
+
+        // Test BSR with same value 0x00000120
+        // Expected: BSR finds bit 8 (highest set bit)
+        // bsr ecx, eax - 0F BD C8
+        0x0F, 0xBD, 0xC8,
+        // cmp ecx, 8 - 83 F9 08
+        0x83, 0xF9, 0x08,
+        // jne fail
+        0x75, 0x19,
+
+        // Test BSF with 0 (should set ZF)
+        // xor eax, eax - 31 C0
+        0x31, 0xC0,
+        // bsf edx, eax - 0F BC D0
+        0x0F, 0xBC, 0xD0,
+        // jnz fail (if ZF is not set, fail)
+        0x75, 0x0F,
+
+        // Test BSR with 1 (bit 0 only)
+        // mov eax, 1 - B8 01 00 00 00
+        0xB8, 0x01, 0x00, 0x00, 0x00,
+        // bsr esi, eax - 0F BD F0
+        0x0F, 0xBD, 0xF0,
+        // cmp esi, 0 - 83 FE 00
+        0x83, 0xFE, 0x00,
+        // jne fail
+        0x75, 0x09,
+
+        // success: output 'B'
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        0xB0, 'B',
+        0xEE,
+        0xF4,
+
+        // fail: hlt
+        0xF4,
+    };
+
+    var emu = try Emulator.init(allocator, .{
+        .memory_size = 1024 * 1024,
+        .enable_uart = true,
+    });
+    defer emu.deinit();
+
+    try emu.loadBinary(&code, 0x0000);
+    try emu.run();
+
+    const output = emu.getUartOutput();
+    try std.testing.expect(output != null);
+    try std.testing.expectEqualStrings("B", output.?);
+}

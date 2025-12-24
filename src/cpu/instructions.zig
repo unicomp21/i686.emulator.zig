@@ -918,6 +918,102 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
             cpu.regs.setReg32(modrm.reg, @bitCast(@as(i32, value)));
         },
 
+        // SETcc r/m8 (0x90-0x9F) - Set byte on condition
+        0x90 => try setCC(cpu, cpu.flags.overflow), // SETO
+        0x91 => try setCC(cpu, !cpu.flags.overflow), // SETNO
+        0x92 => try setCC(cpu, cpu.flags.carry), // SETB/SETC/SETNAE
+        0x93 => try setCC(cpu, !cpu.flags.carry), // SETAE/SETNB/SETNC
+        0x94 => try setCC(cpu, cpu.flags.zero), // SETE/SETZ
+        0x95 => try setCC(cpu, !cpu.flags.zero), // SETNE/SETNZ
+        0x96 => try setCC(cpu, cpu.flags.carry or cpu.flags.zero), // SETBE/SETNA
+        0x97 => try setCC(cpu, !cpu.flags.carry and !cpu.flags.zero), // SETA/SETNBE
+        0x98 => try setCC(cpu, cpu.flags.sign), // SETS
+        0x99 => try setCC(cpu, !cpu.flags.sign), // SETNS
+        0x9A => try setCC(cpu, cpu.flags.parity), // SETP/SETPE
+        0x9B => try setCC(cpu, !cpu.flags.parity), // SETNP/SETPO
+        0x9C => try setCC(cpu, cpu.flags.sign != cpu.flags.overflow), // SETL/SETNGE
+        0x9D => try setCC(cpu, cpu.flags.sign == cpu.flags.overflow), // SETGE/SETNL
+        0x9E => try setCC(cpu, cpu.flags.zero or (cpu.flags.sign != cpu.flags.overflow)), // SETLE/SETNG
+        0x9F => try setCC(cpu, !cpu.flags.zero and (cpu.flags.sign == cpu.flags.overflow)), // SETG/SETNLE
+
+        // BT r/m32, r32 - Bit test
+        0xA3 => {
+            const modrm = try fetchModRM(cpu);
+            const bit_pos = cpu.regs.getReg32(modrm.reg) & 31;
+            const value = try readRM32(cpu, modrm);
+            cpu.flags.carry = ((value >> @truncate(bit_pos)) & 1) != 0;
+        },
+
+        // BTS r/m32, r32 - Bit test and set
+        0xAB => {
+            const modrm = try fetchModRM(cpu);
+            const bit_pos = cpu.regs.getReg32(modrm.reg) & 31;
+            const value = try readRM32(cpu, modrm);
+            cpu.flags.carry = ((value >> @truncate(bit_pos)) & 1) != 0;
+            const new_value = value | (@as(u32, 1) << @truncate(bit_pos));
+            try writeRM32(cpu, modrm, new_value);
+        },
+
+        // BTR r/m32, r32 - Bit test and reset
+        0xB3 => {
+            const modrm = try fetchModRM(cpu);
+            const bit_pos = cpu.regs.getReg32(modrm.reg) & 31;
+            const value = try readRM32(cpu, modrm);
+            cpu.flags.carry = ((value >> @truncate(bit_pos)) & 1) != 0;
+            const new_value = value & ~(@as(u32, 1) << @truncate(bit_pos));
+            try writeRM32(cpu, modrm, new_value);
+        },
+
+        // BTC r/m32, r32 - Bit test and complement
+        0xBB => {
+            const modrm = try fetchModRM(cpu);
+            const bit_pos = cpu.regs.getReg32(modrm.reg) & 31;
+            const value = try readRM32(cpu, modrm);
+            cpu.flags.carry = ((value >> @truncate(bit_pos)) & 1) != 0;
+            const new_value = value ^ (@as(u32, 1) << @truncate(bit_pos));
+            try writeRM32(cpu, modrm, new_value);
+        },
+
+        // BSF r32, r/m32 - Bit scan forward
+        0xBC => {
+            const modrm = try fetchModRM(cpu);
+            const value = try readRM32(cpu, modrm);
+            if (value == 0) {
+                cpu.flags.zero = true;
+                // Destination is undefined when ZF=1, but we leave it unchanged
+            } else {
+                cpu.flags.zero = false;
+                // Find the lowest set bit (counting from bit 0)
+                var bit_index: u32 = 0;
+                while (bit_index < 32) : (bit_index += 1) {
+                    if (((value >> @truncate(bit_index)) & 1) != 0) {
+                        break;
+                    }
+                }
+                cpu.regs.setReg32(modrm.reg, bit_index);
+            }
+        },
+
+        // BSR r32, r/m32 - Bit scan reverse
+        0xBD => {
+            const modrm = try fetchModRM(cpu);
+            const value = try readRM32(cpu, modrm);
+            if (value == 0) {
+                cpu.flags.zero = true;
+                // Destination is undefined when ZF=1, but we leave it unchanged
+            } else {
+                cpu.flags.zero = false;
+                // Find the highest set bit (counting from bit 0)
+                var bit_index: u32 = 31;
+                while (bit_index > 0) : (bit_index -= 1) {
+                    if (((value >> @truncate(bit_index)) & 1) != 0) {
+                        break;
+                    }
+                }
+                cpu.regs.setReg32(modrm.reg, bit_index);
+            }
+        },
+
         else => {
             cpu.dumpInstructionHistory();
             std.debug.print("\nINVALID TWO-BYTE OPCODE: 0F {X:02} at {X:04}:{X:08}\n", .{ opcode, cpu.current_instr_cs, cpu.current_instr_eip });
@@ -1676,119 +1772,297 @@ fn subWithFlags32(cpu: *Cpu, a: u32, b: u32) u32 {
 
 // String instruction helpers
 fn execMovs(cpu: *Cpu, size: u8) !void {
-    // Use ESI and EDI as linear addresses
-    switch (size) {
-        1 => {
-            const value = try cpu.readMemByte(cpu.regs.esi);
-            try cpu.writeMemByte(cpu.regs.edi, value);
-        },
-        2 => {
-            const value = try cpu.readMemWord(cpu.regs.esi);
-            try cpu.writeMemWord(cpu.regs.edi, value);
-        },
-        4 => {
-            const value = try cpu.readMemDword(cpu.regs.esi);
-            try cpu.writeMemDword(cpu.regs.edi, value);
-        },
-        else => unreachable,
-    }
-
+    const rep_prefix = cpu.prefix.rep;
     const delta: i32 = if (cpu.flags.direction) -@as(i32, size) else @as(i32, size);
-    cpu.regs.esi = @bitCast(@as(i32, @bitCast(cpu.regs.esi)) +% delta);
-    cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+
+    switch (rep_prefix) {
+        .rep, .repne => {
+            // REP prefix - repeat while ECX != 0
+            while (cpu.regs.ecx != 0) {
+                // Move one element
+                switch (size) {
+                    1 => {
+                        const value = try cpu.readMemByte(cpu.regs.esi);
+                        try cpu.writeMemByte(cpu.regs.edi, value);
+                    },
+                    2 => {
+                        const value = try cpu.readMemWord(cpu.regs.esi);
+                        try cpu.writeMemWord(cpu.regs.edi, value);
+                    },
+                    4 => {
+                        const value = try cpu.readMemDword(cpu.regs.esi);
+                        try cpu.writeMemDword(cpu.regs.edi, value);
+                    },
+                    else => unreachable,
+                }
+
+                // Update pointers and counter
+                cpu.regs.esi = @bitCast(@as(i32, @bitCast(cpu.regs.esi)) +% delta);
+                cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+                cpu.regs.ecx -%= 1;
+            }
+        },
+        .none => {
+            // No REP prefix - execute once
+            switch (size) {
+                1 => {
+                    const value = try cpu.readMemByte(cpu.regs.esi);
+                    try cpu.writeMemByte(cpu.regs.edi, value);
+                },
+                2 => {
+                    const value = try cpu.readMemWord(cpu.regs.esi);
+                    try cpu.writeMemWord(cpu.regs.edi, value);
+                },
+                4 => {
+                    const value = try cpu.readMemDword(cpu.regs.esi);
+                    try cpu.writeMemDword(cpu.regs.edi, value);
+                },
+                else => unreachable,
+            }
+
+            // Update pointers
+            cpu.regs.esi = @bitCast(@as(i32, @bitCast(cpu.regs.esi)) +% delta);
+            cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+        },
+    }
 }
 
 fn execCmps(cpu: *Cpu, size: u8) !void {
-    // Use ESI and EDI as linear addresses
-    switch (size) {
-        1 => {
-            const src = try cpu.readMemByte(cpu.regs.esi);
-            const dst = try cpu.readMemByte(cpu.regs.edi);
-            _ = subWithFlags8(cpu, src, dst);
-        },
-        2 => {
-            const src = try cpu.readMemWord(cpu.regs.esi);
-            const dst = try cpu.readMemWord(cpu.regs.edi);
-            _ = subWithFlags16(cpu, src, dst);
-        },
-        4 => {
-            const src = try cpu.readMemDword(cpu.regs.esi);
-            const dst = try cpu.readMemDword(cpu.regs.edi);
-            _ = subWithFlags32(cpu, src, dst);
-        },
-        else => unreachable,
-    }
-
+    const rep_prefix = cpu.prefix.rep;
     const delta: i32 = if (cpu.flags.direction) -@as(i32, size) else @as(i32, size);
-    cpu.regs.esi = @bitCast(@as(i32, @bitCast(cpu.regs.esi)) +% delta);
-    cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+
+    switch (rep_prefix) {
+        .rep => {
+            // REPE/REPZ - repeat while ECX != 0 and ZF = 1
+            while (cpu.regs.ecx != 0) {
+                switch (size) {
+                    1 => {
+                        const src = try cpu.readMemByte(cpu.regs.esi);
+                        const dst = try cpu.readMemByte(cpu.regs.edi);
+                        _ = subWithFlags8(cpu, src, dst);
+                    },
+                    2 => {
+                        const src = try cpu.readMemWord(cpu.regs.esi);
+                        const dst = try cpu.readMemWord(cpu.regs.edi);
+                        _ = subWithFlags16(cpu, src, dst);
+                    },
+                    4 => {
+                        const src = try cpu.readMemDword(cpu.regs.esi);
+                        const dst = try cpu.readMemDword(cpu.regs.edi);
+                        _ = subWithFlags32(cpu, src, dst);
+                    },
+                    else => unreachable,
+                }
+
+                cpu.regs.esi = @bitCast(@as(i32, @bitCast(cpu.regs.esi)) +% delta);
+                cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+                cpu.regs.ecx -%= 1;
+
+                // REPE: break if ZF = 0 (not equal)
+                if (!cpu.flags.zero) break;
+            }
+        },
+        .repne => {
+            // REPNE/REPNZ - repeat while ECX != 0 and ZF = 0
+            while (cpu.regs.ecx != 0) {
+                switch (size) {
+                    1 => {
+                        const src = try cpu.readMemByte(cpu.regs.esi);
+                        const dst = try cpu.readMemByte(cpu.regs.edi);
+                        _ = subWithFlags8(cpu, src, dst);
+                    },
+                    2 => {
+                        const src = try cpu.readMemWord(cpu.regs.esi);
+                        const dst = try cpu.readMemWord(cpu.regs.edi);
+                        _ = subWithFlags16(cpu, src, dst);
+                    },
+                    4 => {
+                        const src = try cpu.readMemDword(cpu.regs.esi);
+                        const dst = try cpu.readMemDword(cpu.regs.edi);
+                        _ = subWithFlags32(cpu, src, dst);
+                    },
+                    else => unreachable,
+                }
+
+                cpu.regs.esi = @bitCast(@as(i32, @bitCast(cpu.regs.esi)) +% delta);
+                cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+                cpu.regs.ecx -%= 1;
+
+                // REPNE: break if ZF = 1 (equal)
+                if (cpu.flags.zero) break;
+            }
+        },
+        .none => {
+            // No REP prefix - execute once
+            switch (size) {
+                1 => {
+                    const src = try cpu.readMemByte(cpu.regs.esi);
+                    const dst = try cpu.readMemByte(cpu.regs.edi);
+                    _ = subWithFlags8(cpu, src, dst);
+                },
+                2 => {
+                    const src = try cpu.readMemWord(cpu.regs.esi);
+                    const dst = try cpu.readMemWord(cpu.regs.edi);
+                    _ = subWithFlags16(cpu, src, dst);
+                },
+                4 => {
+                    const src = try cpu.readMemDword(cpu.regs.esi);
+                    const dst = try cpu.readMemDword(cpu.regs.edi);
+                    _ = subWithFlags32(cpu, src, dst);
+                },
+                else => unreachable,
+            }
+
+            cpu.regs.esi = @bitCast(@as(i32, @bitCast(cpu.regs.esi)) +% delta);
+            cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+        },
+    }
 }
 
 fn execStos(cpu: *Cpu, size: u8) !void {
-    // Use EDI as linear address
-    switch (size) {
-        1 => {
-            const value: u8 = @truncate(cpu.regs.eax);
-            try cpu.writeMemByte(cpu.regs.edi, value);
-        },
-        2 => {
-            const value: u16 = @truncate(cpu.regs.eax);
-            try cpu.writeMemWord(cpu.regs.edi, value);
-        },
-        4 => {
-            try cpu.writeMemDword(cpu.regs.edi, cpu.regs.eax);
-        },
-        else => unreachable,
-    }
-
+    const rep_prefix = cpu.prefix.rep;
     const delta: i32 = if (cpu.flags.direction) -@as(i32, size) else @as(i32, size);
-    cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+
+    switch (rep_prefix) {
+        .rep, .repne => {
+            // REP prefix - repeat while ECX != 0
+            while (cpu.regs.ecx != 0) {
+                switch (size) {
+                    1 => try cpu.writeMemByte(cpu.regs.edi, @truncate(cpu.regs.eax)),
+                    2 => try cpu.writeMemWord(cpu.regs.edi, @truncate(cpu.regs.eax)),
+                    4 => try cpu.writeMemDword(cpu.regs.edi, cpu.regs.eax),
+                    else => unreachable,
+                }
+
+                cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+                cpu.regs.ecx -%= 1;
+            }
+        },
+        .none => {
+            // No REP prefix - execute once
+            switch (size) {
+                1 => try cpu.writeMemByte(cpu.regs.edi, @truncate(cpu.regs.eax)),
+                2 => try cpu.writeMemWord(cpu.regs.edi, @truncate(cpu.regs.eax)),
+                4 => try cpu.writeMemDword(cpu.regs.edi, cpu.regs.eax),
+                else => unreachable,
+            }
+
+            cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+        },
+    }
 }
 
 fn execLods(cpu: *Cpu, size: u8) !void {
-    // Use ESI as linear address
-    switch (size) {
-        1 => {
-            const value = try cpu.readMemByte(cpu.regs.esi);
-            cpu.regs.setReg8(0, value); // AL
-        },
-        2 => {
-            const value = try cpu.readMemWord(cpu.regs.esi);
-            cpu.regs.setReg16(0, value); // AX
-        },
-        4 => {
-            const value = try cpu.readMemDword(cpu.regs.esi);
-            cpu.regs.eax = value;
-        },
-        else => unreachable,
-    }
-
+    const rep_prefix = cpu.prefix.rep;
     const delta: i32 = if (cpu.flags.direction) -@as(i32, size) else @as(i32, size);
-    cpu.regs.esi = @bitCast(@as(i32, @bitCast(cpu.regs.esi)) +% delta);
+
+    switch (rep_prefix) {
+        .rep, .repne => {
+            // REP prefix - repeat while ECX != 0 (unusual but valid)
+            while (cpu.regs.ecx != 0) {
+                switch (size) {
+                    1 => cpu.regs.setReg8(0, try cpu.readMemByte(cpu.regs.esi)),
+                    2 => cpu.regs.setReg16(0, try cpu.readMemWord(cpu.regs.esi)),
+                    4 => cpu.regs.eax = try cpu.readMemDword(cpu.regs.esi),
+                    else => unreachable,
+                }
+
+                cpu.regs.esi = @bitCast(@as(i32, @bitCast(cpu.regs.esi)) +% delta);
+                cpu.regs.ecx -%= 1;
+            }
+        },
+        .none => {
+            // No REP prefix - execute once (normal case)
+            switch (size) {
+                1 => cpu.regs.setReg8(0, try cpu.readMemByte(cpu.regs.esi)),
+                2 => cpu.regs.setReg16(0, try cpu.readMemWord(cpu.regs.esi)),
+                4 => cpu.regs.eax = try cpu.readMemDword(cpu.regs.esi),
+                else => unreachable,
+            }
+
+            cpu.regs.esi = @bitCast(@as(i32, @bitCast(cpu.regs.esi)) +% delta);
+        },
+    }
 }
 
 fn execScas(cpu: *Cpu, size: u8) !void {
-    // Use EDI as linear address
-    switch (size) {
-        1 => {
-            const al: u8 = @truncate(cpu.regs.eax);
-            const value = try cpu.readMemByte(cpu.regs.edi);
-            _ = subWithFlags8(cpu, al, value);
-        },
-        2 => {
-            const ax: u16 = @truncate(cpu.regs.eax);
-            const value = try cpu.readMemWord(cpu.regs.edi);
-            _ = subWithFlags16(cpu, ax, value);
-        },
-        4 => {
-            const value = try cpu.readMemDword(cpu.regs.edi);
-            _ = subWithFlags32(cpu, cpu.regs.eax, value);
-        },
-        else => unreachable,
-    }
-
+    const rep_prefix = cpu.prefix.rep;
     const delta: i32 = if (cpu.flags.direction) -@as(i32, size) else @as(i32, size);
-    cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+
+    switch (rep_prefix) {
+        .rep => {
+            // REPE/REPZ - repeat while ECX != 0 and ZF = 1
+            while (cpu.regs.ecx != 0) {
+                switch (size) {
+                    1 => {
+                        const value = try cpu.readMemByte(cpu.regs.edi);
+                        _ = subWithFlags8(cpu, @truncate(cpu.regs.eax), value);
+                    },
+                    2 => {
+                        const value = try cpu.readMemWord(cpu.regs.edi);
+                        _ = subWithFlags16(cpu, @truncate(cpu.regs.eax), value);
+                    },
+                    4 => {
+                        const value = try cpu.readMemDword(cpu.regs.edi);
+                        _ = subWithFlags32(cpu, cpu.regs.eax, value);
+                    },
+                    else => unreachable,
+                }
+
+                cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+                cpu.regs.ecx -%= 1;
+
+                // REPE: break if ZF = 0 (not equal)
+                if (!cpu.flags.zero) break;
+            }
+        },
+        .repne => {
+            // REPNE/REPNZ - repeat while ECX != 0 and ZF = 0
+            while (cpu.regs.ecx != 0) {
+                switch (size) {
+                    1 => {
+                        const value = try cpu.readMemByte(cpu.regs.edi);
+                        _ = subWithFlags8(cpu, @truncate(cpu.regs.eax), value);
+                    },
+                    2 => {
+                        const value = try cpu.readMemWord(cpu.regs.edi);
+                        _ = subWithFlags16(cpu, @truncate(cpu.regs.eax), value);
+                    },
+                    4 => {
+                        const value = try cpu.readMemDword(cpu.regs.edi);
+                        _ = subWithFlags32(cpu, cpu.regs.eax, value);
+                    },
+                    else => unreachable,
+                }
+
+                cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+                cpu.regs.ecx -%= 1;
+
+                // REPNE: break if ZF = 1 (equal)
+                if (cpu.flags.zero) break;
+            }
+        },
+        .none => {
+            // No REP prefix - execute once
+            switch (size) {
+                1 => {
+                    const value = try cpu.readMemByte(cpu.regs.edi);
+                    _ = subWithFlags8(cpu, @truncate(cpu.regs.eax), value);
+                },
+                2 => {
+                    const value = try cpu.readMemWord(cpu.regs.edi);
+                    _ = subWithFlags16(cpu, @truncate(cpu.regs.eax), value);
+                },
+                4 => {
+                    const value = try cpu.readMemDword(cpu.regs.edi);
+                    _ = subWithFlags32(cpu, cpu.regs.eax, value);
+                },
+                else => unreachable,
+            }
+
+            cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+        },
+    }
 }
 
 fn jccRel8(cpu: *Cpu, condition: bool) !void {
