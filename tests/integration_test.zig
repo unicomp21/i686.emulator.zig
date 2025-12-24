@@ -764,3 +764,59 @@ test "integration: mul div" {
     try std.testing.expect(output != null);
     try std.testing.expectEqualStrings("M", output.?);
 }
+
+// Test: PUSHF/POPF flag preservation
+test "integration: pushf popf" {
+    const allocator = std.testing.allocator;
+
+    // Test that PUSHF/POPF preserves flags correctly
+    const code = [_]u8{
+        // Setup stack
+        // mov esp, 0x1000 - BC 00 10 00 00
+        0xBC, 0x00, 0x10, 0x00, 0x00,
+        // Set specific flags using arithmetic
+        // mov al, 0xFF - B0 FF
+        0xB0, 0xFF,
+        // add al, 1 - 04 01 (this sets CF=1, ZF=1, AF=1, PF=1)
+        0x04, 0x01,
+        // pushfd - save flags to stack - 9C
+        0x9C,
+        // Modify flags
+        // xor eax, eax - 31 C0 (this sets ZF=1, clears CF, SF, OF)
+        0x31, 0xC0,
+        // Now flags should be different
+        // popfd - restore flags from stack - 9D
+        0x9D,
+        // If carry flag was restored, jump to success
+        // jc success - 72 04
+        0x72, 0x04,
+        // fail: output 'F'
+        // mov al, 'F' - B0 46
+        0xB0, 'F',
+        // jmp end - EB 02
+        0xEB, 0x02,
+        // success: output 'P' (for PUSHF/POPF)
+        // mov al, 'P' - B0 50
+        0xB0, 'P',
+        // end: output character
+        // mov edx, 0x3F8 - BA F8 03 00 00
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        // out dx, al - EE
+        0xEE,
+        // hlt - F4
+        0xF4,
+    };
+
+    var emu = try Emulator.init(allocator, .{
+        .memory_size = 1024 * 1024,
+        .enable_uart = true,
+    });
+    defer emu.deinit();
+
+    try emu.loadBinary(&code, 0x0000);
+    try emu.run();
+
+    const output = emu.getUartOutput();
+    try std.testing.expect(output != null);
+    try std.testing.expectEqualStrings("P", output.?);
+}

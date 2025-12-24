@@ -33,6 +33,87 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
         // NOP
         0x90 => {},
 
+        // XCHG EAX, r32 (91-97) - exchange register with EAX
+        0x91...0x97 => {
+            const reg: u3 = @truncate(opcode & 0x7);
+            const temp = cpu.regs.eax;
+            cpu.regs.eax = cpu.regs.getReg32(reg);
+            cpu.regs.setReg32(reg, temp);
+        },
+
+        // CBW/CWDE - Sign extend AL to AX or AX to EAX
+        0x98 => {
+            if (cpu.prefix.operand_size_override) {
+                // CBW: AL -> AX
+                const al: i8 = @bitCast(@as(u8, @truncate(cpu.regs.eax)));
+                cpu.regs.setReg16(0, @bitCast(@as(i16, al)));
+            } else {
+                // CWDE: AX -> EAX
+                const ax: i16 = @bitCast(@as(u16, @truncate(cpu.regs.eax)));
+                cpu.regs.eax = @bitCast(@as(i32, ax));
+            }
+        },
+
+        // CWD/CDQ - Sign extend AX to DX:AX or EAX to EDX:EAX
+        0x99 => {
+            if (cpu.prefix.operand_size_override) {
+                // CWD: AX -> DX:AX
+                const ax: i16 = @bitCast(@as(u16, @truncate(cpu.regs.eax)));
+                cpu.regs.setReg16(2, if (ax < 0) 0xFFFF else 0x0000);
+            } else {
+                // CDQ: EAX -> EDX:EAX
+                const eax: i32 = @bitCast(cpu.regs.eax);
+                cpu.regs.edx = if (eax < 0) 0xFFFFFFFF else 0x00000000;
+            }
+        },
+
+        // PUSHF/PUSHFD - Push flags
+        0x9C => {
+            if (cpu.prefix.operand_size_override) {
+                // PUSHF: Push 16-bit flags
+                try cpu.push16(@truncate(cpu.flags.toU32()));
+            } else {
+                // PUSHFD: Push 32-bit EFLAGS
+                try cpu.push(cpu.flags.toU32());
+            }
+        },
+
+        // POPF/POPFD - Pop flags
+        0x9D => {
+            if (cpu.prefix.operand_size_override) {
+                // POPF: Pop 16-bit flags
+                const value = try cpu.pop16();
+                // Preserve upper 16 bits, update lower 16 bits
+                const current = cpu.flags.toU32();
+                cpu.flags.fromU32((current & 0xFFFF0000) | value);
+            } else {
+                // POPFD: Pop 32-bit EFLAGS
+                const value = try cpu.pop();
+                cpu.flags.fromU32(value);
+            }
+        },
+
+        // SAHF - Store AH into flags
+        0x9E => {
+            const ah: u8 = @truncate(cpu.regs.eax >> 8);
+            cpu.flags.carry = (ah & 0x01) != 0;
+            cpu.flags.parity = (ah & 0x04) != 0;
+            cpu.flags.auxiliary = (ah & 0x10) != 0;
+            cpu.flags.zero = (ah & 0x40) != 0;
+            cpu.flags.sign = (ah & 0x80) != 0;
+        },
+
+        // LAHF - Load AH from flags
+        0x9F => {
+            var ah: u8 = 0x02; // Bit 1 is always 1
+            if (cpu.flags.carry) ah |= 0x01;
+            if (cpu.flags.parity) ah |= 0x04;
+            if (cpu.flags.auxiliary) ah |= 0x10;
+            if (cpu.flags.zero) ah |= 0x40;
+            if (cpu.flags.sign) ah |= 0x80;
+            cpu.regs.setReg8(4, ah); // AH
+        },
+
         // HLT
         0xF4 => cpu.halt(),
 
@@ -348,6 +429,31 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             }
         },
 
+        // XCHG r/m8, r8
+        0x86 => {
+            const modrm = try fetchModRM(cpu);
+            const reg_val = cpu.regs.getReg8(modrm.reg);
+            const rm_val = try readRM8(cpu, modrm);
+            cpu.regs.setReg8(modrm.reg, rm_val);
+            try writeRM8(cpu, modrm, reg_val);
+        },
+
+        // XCHG r/m32, r32
+        0x87 => {
+            const modrm = try fetchModRM(cpu);
+            if (cpu.prefix.operand_size_override) {
+                const reg_val = cpu.regs.getReg16(modrm.reg);
+                const rm_val = try readRM16(cpu, modrm);
+                cpu.regs.setReg16(modrm.reg, rm_val);
+                try writeRM16(cpu, modrm, reg_val);
+            } else {
+                const reg_val = cpu.regs.getReg32(modrm.reg);
+                const rm_val = try readRM32(cpu, modrm);
+                cpu.regs.setReg32(modrm.reg, rm_val);
+                try writeRM32(cpu, modrm, reg_val);
+            }
+        },
+
         // TEST r/m8, r8
         0x84 => {
             const modrm = try fetchModRM(cpu);
@@ -499,6 +605,20 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             cpu.regs.esp +%= imm;
         },
 
+        // LEAVE - High-level procedure exit (mov esp, ebp; pop ebp)
+        0xC9 => {
+            if (cpu.prefix.operand_size_override) {
+                // 16-bit: mov sp, bp; pop bp
+                cpu.regs.setReg16(4, cpu.regs.getReg16(5)); // sp = bp
+                const value = try cpu.pop16();
+                cpu.regs.setReg16(5, value); // bp
+            } else {
+                // 32-bit: mov esp, ebp; pop ebp
+                cpu.regs.esp = cpu.regs.ebp;
+                cpu.regs.ebp = try cpu.pop();
+            }
+        },
+
         // INT imm8
         0xCD => {
             const vector = try fetchByte(cpu);
@@ -551,6 +671,76 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
         // STD
         0xFD => {
             cpu.flags.direction = true;
+        },
+
+        // MOVSB - Move string byte
+        0xA4 => {
+            try execMovs(cpu, 1);
+        },
+
+        // MOVSD - Move string dword
+        0xA5 => {
+            if (cpu.prefix.operand_size_override) {
+                try execMovs(cpu, 2);
+            } else {
+                try execMovs(cpu, 4);
+            }
+        },
+
+        // CMPSB - Compare string byte
+        0xA6 => {
+            try execCmps(cpu, 1);
+        },
+
+        // CMPSD - Compare string dword
+        0xA7 => {
+            if (cpu.prefix.operand_size_override) {
+                try execCmps(cpu, 2);
+            } else {
+                try execCmps(cpu, 4);
+            }
+        },
+
+        // STOSB - Store string byte
+        0xAA => {
+            try execStos(cpu, 1);
+        },
+
+        // STOSD - Store string dword
+        0xAB => {
+            if (cpu.prefix.operand_size_override) {
+                try execStos(cpu, 2);
+            } else {
+                try execStos(cpu, 4);
+            }
+        },
+
+        // LODSB - Load string byte
+        0xAC => {
+            try execLods(cpu, 1);
+        },
+
+        // LODSD - Load string dword
+        0xAD => {
+            if (cpu.prefix.operand_size_override) {
+                try execLods(cpu, 2);
+            } else {
+                try execLods(cpu, 4);
+            }
+        },
+
+        // SCASB - Scan string byte
+        0xAE => {
+            try execScas(cpu, 1);
+        },
+
+        // SCASD - Scan string dword
+        0xAF => {
+            if (cpu.prefix.operand_size_override) {
+                try execScas(cpu, 2);
+            } else {
+                try execScas(cpu, 4);
+            }
         },
 
         // Two-byte opcodes (0F prefix)
@@ -1484,6 +1674,123 @@ fn subWithFlags32(cpu: *Cpu, a: u32, b: u32) u32 {
     return result;
 }
 
+// String instruction helpers
+fn execMovs(cpu: *Cpu, size: u8) !void {
+    // Use ESI and EDI as linear addresses
+    switch (size) {
+        1 => {
+            const value = try cpu.readMemByte(cpu.regs.esi);
+            try cpu.writeMemByte(cpu.regs.edi, value);
+        },
+        2 => {
+            const value = try cpu.readMemWord(cpu.regs.esi);
+            try cpu.writeMemWord(cpu.regs.edi, value);
+        },
+        4 => {
+            const value = try cpu.readMemDword(cpu.regs.esi);
+            try cpu.writeMemDword(cpu.regs.edi, value);
+        },
+        else => unreachable,
+    }
+
+    const delta: i32 = if (cpu.flags.direction) -@as(i32, size) else @as(i32, size);
+    cpu.regs.esi = @bitCast(@as(i32, @bitCast(cpu.regs.esi)) +% delta);
+    cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+}
+
+fn execCmps(cpu: *Cpu, size: u8) !void {
+    // Use ESI and EDI as linear addresses
+    switch (size) {
+        1 => {
+            const src = try cpu.readMemByte(cpu.regs.esi);
+            const dst = try cpu.readMemByte(cpu.regs.edi);
+            _ = subWithFlags8(cpu, src, dst);
+        },
+        2 => {
+            const src = try cpu.readMemWord(cpu.regs.esi);
+            const dst = try cpu.readMemWord(cpu.regs.edi);
+            _ = subWithFlags16(cpu, src, dst);
+        },
+        4 => {
+            const src = try cpu.readMemDword(cpu.regs.esi);
+            const dst = try cpu.readMemDword(cpu.regs.edi);
+            _ = subWithFlags32(cpu, src, dst);
+        },
+        else => unreachable,
+    }
+
+    const delta: i32 = if (cpu.flags.direction) -@as(i32, size) else @as(i32, size);
+    cpu.regs.esi = @bitCast(@as(i32, @bitCast(cpu.regs.esi)) +% delta);
+    cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+}
+
+fn execStos(cpu: *Cpu, size: u8) !void {
+    // Use EDI as linear address
+    switch (size) {
+        1 => {
+            const value: u8 = @truncate(cpu.regs.eax);
+            try cpu.writeMemByte(cpu.regs.edi, value);
+        },
+        2 => {
+            const value: u16 = @truncate(cpu.regs.eax);
+            try cpu.writeMemWord(cpu.regs.edi, value);
+        },
+        4 => {
+            try cpu.writeMemDword(cpu.regs.edi, cpu.regs.eax);
+        },
+        else => unreachable,
+    }
+
+    const delta: i32 = if (cpu.flags.direction) -@as(i32, size) else @as(i32, size);
+    cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+}
+
+fn execLods(cpu: *Cpu, size: u8) !void {
+    // Use ESI as linear address
+    switch (size) {
+        1 => {
+            const value = try cpu.readMemByte(cpu.regs.esi);
+            cpu.regs.setReg8(0, value); // AL
+        },
+        2 => {
+            const value = try cpu.readMemWord(cpu.regs.esi);
+            cpu.regs.setReg16(0, value); // AX
+        },
+        4 => {
+            const value = try cpu.readMemDword(cpu.regs.esi);
+            cpu.regs.eax = value;
+        },
+        else => unreachable,
+    }
+
+    const delta: i32 = if (cpu.flags.direction) -@as(i32, size) else @as(i32, size);
+    cpu.regs.esi = @bitCast(@as(i32, @bitCast(cpu.regs.esi)) +% delta);
+}
+
+fn execScas(cpu: *Cpu, size: u8) !void {
+    // Use EDI as linear address
+    switch (size) {
+        1 => {
+            const al: u8 = @truncate(cpu.regs.eax);
+            const value = try cpu.readMemByte(cpu.regs.edi);
+            _ = subWithFlags8(cpu, al, value);
+        },
+        2 => {
+            const ax: u16 = @truncate(cpu.regs.eax);
+            const value = try cpu.readMemWord(cpu.regs.edi);
+            _ = subWithFlags16(cpu, ax, value);
+        },
+        4 => {
+            const value = try cpu.readMemDword(cpu.regs.edi);
+            _ = subWithFlags32(cpu, cpu.regs.eax, value);
+        },
+        else => unreachable,
+    }
+
+    const delta: i32 = if (cpu.flags.direction) -@as(i32, size) else @as(i32, size);
+    cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+}
+
 fn jccRel8(cpu: *Cpu, condition: bool) !void {
     const rel = try fetchByte(cpu);
     if (condition) {
@@ -1498,6 +1805,12 @@ fn jccRel32(cpu: *Cpu, condition: bool) !void {
         const offset: i32 = @bitCast(rel);
         cpu.eip = @bitCast(@as(i32, @bitCast(cpu.eip)) +% offset);
     }
+}
+
+fn setCC(cpu: *Cpu, condition: bool) !void {
+    const modrm = try fetchModRM(cpu);
+    const value: u8 = if (condition) 1 else 0;
+    try writeRM8(cpu, modrm, value);
 }
 
 fn handleInterrupt(cpu: *Cpu, vector: u8) !void {
