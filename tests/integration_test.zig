@@ -200,3 +200,180 @@ test "integration: xor zero" {
     try std.testing.expect(output != null);
     try std.testing.expectEqualStrings("Z", output.?);
 }
+
+// Test: LGDT and protected mode switch
+test "integration: protected mode" {
+    const allocator = std.testing.allocator;
+
+    // GDT structure at 0x1000:
+    // Entry 0: Null descriptor (8 bytes of 0)
+    // Entry 1: Code segment (0x08): base=0, limit=0xFFFFF, 32-bit, execute/read
+    // Entry 2: Data segment (0x10): base=0, limit=0xFFFFF, 32-bit, read/write
+    const gdt = [_]u8{
+        // Entry 0: Null descriptor
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // Entry 1: Code segment (0x08) - base=0, limit=0xFFFFF, 32-bit code, DPL=0
+        0xFF, 0xFF, // limit low
+        0x00, 0x00, // base low
+        0x00, // base mid
+        0x9A, // access: present, ring 0, code, execute/read
+        0xCF, // flags: 4KB granularity, 32-bit, limit high = 0xF
+        0x00, // base high
+        // Entry 2: Data segment (0x10) - base=0, limit=0xFFFFF, 32-bit data, DPL=0
+        0xFF, 0xFF, // limit low
+        0x00, 0x00, // base low
+        0x00, // base mid
+        0x92, // access: present, ring 0, data, read/write
+        0xCF, // flags: 4KB granularity, 32-bit, limit high = 0xF
+        0x00, // base high
+    };
+
+    // GDTR structure at 0x0FF6: limit (2 bytes), base (4 bytes)
+    const gdtr = [_]u8{
+        0x17, 0x00, // limit = 23 (3 entries * 8 - 1)
+        0x00, 0x10, 0x00, 0x00, // base = 0x1000
+    };
+
+    // Code at 0x0000:
+    // lgdt [0x0FF6]      ; Load GDT
+    // mov eax, cr0       ; Get CR0
+    // or al, 1           ; Set PE bit
+    // mov cr0, eax       ; Enable protected mode
+    // mov edx, 0x3F8     ; UART port
+    // mov al, 'P'        ; 'P' for protected mode
+    // out dx, al
+    // hlt
+    const code = [_]u8{
+        // lgdt [0x0FF6] - 0F 01 15 <addr32>
+        0x0F, 0x01, 0x15, 0xF6, 0x0F, 0x00, 0x00,
+        // mov eax, cr0 - 0F 20 C0
+        0x0F, 0x20, 0xC0,
+        // or al, 1 - 0C 01
+        0x0C, 0x01,
+        // mov cr0, eax - 0F 22 C0
+        0x0F, 0x22, 0xC0,
+        // mov edx, 0x3F8
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        // mov al, 'P'
+        0xB0, 'P',
+        // out dx, al
+        0xEE,
+        // hlt
+        0xF4,
+    };
+
+    var emu = try Emulator.init(allocator, .{
+        .memory_size = 1024 * 1024,
+        .enable_uart = true,
+    });
+    defer emu.deinit();
+
+    // Load GDT at 0x1000
+    try emu.loadBinary(&gdt, 0x1000);
+    // Load GDTR structure at 0x0FF6
+    try emu.loadBinary(&gdtr, 0x0FF6);
+    // Load code at 0x0000
+    try emu.loadBinary(&code, 0x0000);
+
+    // Run
+    var cycles: usize = 0;
+    while (!emu.cpu_instance.isHalted() and cycles < 100) : (cycles += 1) {
+        try emu.step();
+    }
+
+    // Verify protected mode was entered
+    try std.testing.expect(emu.cpu_instance.mode == .protected);
+    try std.testing.expect(emu.cpu_instance.system.cr0.pe);
+
+    // Verify UART output
+    const output = emu.getUartOutput();
+    try std.testing.expect(output != null);
+    try std.testing.expectEqualStrings("P", output.?);
+}
+
+// Test: LIDT instruction
+test "integration: lidt" {
+    const allocator = std.testing.allocator;
+
+    // IDT pointer structure at 0x0100
+    const idtr = [_]u8{
+        0xFF, 0x07, // limit = 2047 (256 entries * 8 - 1)
+        0x00, 0x20, 0x00, 0x00, // base = 0x2000
+    };
+
+    // Code to load IDT and verify
+    const code = [_]u8{
+        // lidt [0x0100] - 0F 01 1D <addr32>
+        0x0F, 0x01, 0x1D, 0x00, 0x01, 0x00, 0x00,
+        // mov edx, 0x3F8
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        // mov al, 'I'
+        0xB0, 'I',
+        // out dx, al
+        0xEE,
+        // hlt
+        0xF4,
+    };
+
+    var emu = try Emulator.init(allocator, .{
+        .memory_size = 1024 * 1024,
+        .enable_uart = true,
+    });
+    defer emu.deinit();
+
+    // Load IDTR at 0x0100
+    try emu.loadBinary(&idtr, 0x0100);
+    // Load code at 0x0000
+    try emu.loadBinary(&code, 0x0000);
+
+    try emu.run();
+
+    // Verify IDT was loaded
+    try std.testing.expectEqual(@as(u16, 0x07FF), emu.cpu_instance.system.idtr.limit);
+    try std.testing.expectEqual(@as(u32, 0x2000), emu.cpu_instance.system.idtr.base);
+
+    // Verify UART output
+    const output = emu.getUartOutput();
+    try std.testing.expect(output != null);
+    try std.testing.expectEqualStrings("I", output.?);
+}
+
+// Test: MOV CR0 read/write
+test "integration: mov cr0" {
+    const allocator = std.testing.allocator;
+
+    const code = [_]u8{
+        // mov eax, cr0 - read CR0 into EAX
+        0x0F, 0x20, 0xC0,
+        // mov ebx, eax - save original
+        0x89, 0xC3,
+        // or eax, 0x10 - set ET bit (bit 4, always 1 on i686)
+        0x83, 0xC8, 0x10,
+        // mov cr0, eax - write back
+        0x0F, 0x22, 0xC0,
+        // mov eax, cr0 - read again to verify
+        0x0F, 0x20, 0xC0,
+        // mov edx, 0x3F8
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        // mov al, 'C'
+        0xB0, 'C',
+        // out dx, al
+        0xEE,
+        // hlt
+        0xF4,
+    };
+
+    var emu = try Emulator.init(allocator, .{
+        .memory_size = 1024 * 1024,
+        .enable_uart = true,
+    });
+    defer emu.deinit();
+
+    try emu.loadBinary(&code, 0x0000);
+    try emu.run();
+
+    // Verify output
+    const output = emu.getUartOutput();
+    try std.testing.expect(output != null);
+    try std.testing.expectEqualStrings("C", output.?);
+}

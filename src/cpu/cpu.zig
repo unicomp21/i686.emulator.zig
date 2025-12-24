@@ -8,10 +8,17 @@ const memory = @import("../memory/memory.zig");
 const io = @import("../io/io.zig");
 const instructions = @import("instructions.zig");
 const registers = @import("registers.zig");
+const protected_mode = @import("protected_mode.zig");
 
 pub const Registers = registers.Registers;
 pub const Flags = registers.Flags;
 pub const SegmentRegisters = registers.SegmentRegisters;
+pub const SystemRegisters = protected_mode.SystemRegisters;
+pub const SegmentDescriptor = protected_mode.SegmentDescriptor;
+pub const GateDescriptor = protected_mode.GateDescriptor;
+pub const CR0 = protected_mode.CR0;
+pub const CR3 = protected_mode.CR3;
+pub const CR4 = protected_mode.CR4;
 
 /// CPU execution mode
 pub const CpuMode = enum {
@@ -61,6 +68,15 @@ pub const CpuError = error{
     IoError,
 };
 
+/// Instruction history entry for debugging
+pub const InstrHistoryEntry = struct {
+    eip: u32,
+    cs: u16,
+    opcode: u8,
+    opcode2: u8, // For two-byte opcodes
+    is_two_byte: bool,
+};
+
 /// i686 CPU emulator
 pub const Cpu = struct {
     regs: Registers,
@@ -75,6 +91,17 @@ pub const Cpu = struct {
     prefix: PrefixState,
     /// Cycle counter
     cycles: u64,
+    /// System registers (GDTR, IDTR, CR0-CR4, etc.)
+    system: SystemRegisters,
+    /// Cached segment descriptors for performance
+    seg_cache: [6]SegmentDescriptor,
+    /// Instruction history buffer (circular, last 32 instructions)
+    instr_history: [32]InstrHistoryEntry,
+    /// Current position in history buffer
+    instr_history_pos: usize,
+    /// Current instruction being decoded (for history)
+    current_instr_eip: u32,
+    current_instr_cs: u16,
 
     const Self = @This();
 
@@ -105,6 +132,12 @@ pub const Cpu = struct {
             .io_ctrl = io_ctrl,
             .prefix = .{},
             .cycles = 0,
+            .system = SystemRegisters.init(),
+            .seg_cache = [_]SegmentDescriptor{SegmentDescriptor.fromBytes([8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 })} ** 6,
+            .instr_history = [_]InstrHistoryEntry{.{ .eip = 0, .cs = 0, .opcode = 0, .opcode2 = 0, .is_two_byte = false }} ** 32,
+            .instr_history_pos = 0,
+            .current_instr_eip = 0,
+            .current_instr_cs = 0,
         };
     }
 
@@ -119,6 +152,40 @@ pub const Cpu = struct {
         self.halted = false;
         self.prefix.reset();
         self.cycles = 0;
+        self.system = SystemRegisters.init();
+        self.seg_cache = [_]SegmentDescriptor{SegmentDescriptor.fromBytes([8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 })} ** 6;
+        self.instr_history = [_]InstrHistoryEntry{.{ .eip = 0, .cs = 0, .opcode = 0, .opcode2 = 0, .is_two_byte = false }} ** 32;
+        self.instr_history_pos = 0;
+    }
+
+    /// Record instruction in history buffer
+    pub fn recordInstruction(self: *Self, opcode: u8, opcode2: u8, is_two_byte: bool) void {
+        self.instr_history[self.instr_history_pos] = .{
+            .eip = self.current_instr_eip,
+            .cs = self.current_instr_cs,
+            .opcode = opcode,
+            .opcode2 = opcode2,
+            .is_two_byte = is_two_byte,
+        };
+        self.instr_history_pos = (self.instr_history_pos + 1) % 32;
+    }
+
+    /// Dump instruction history (for debugging)
+    pub fn dumpInstructionHistory(self: *const Self) void {
+        std.debug.print("\n=== INSTRUCTION HISTORY (last 32) ===\n", .{});
+        var i: usize = 0;
+        while (i < 32) : (i += 1) {
+            const idx = (self.instr_history_pos + i) % 32;
+            const entry = self.instr_history[idx];
+            if (entry.eip != 0 or entry.opcode != 0) {
+                if (entry.is_two_byte) {
+                    std.debug.print("  [{d:2}] {X:04}:{X:08}  0F {X:02}\n", .{ i, entry.cs, entry.eip, entry.opcode2 });
+                } else {
+                    std.debug.print("  [{d:2}] {X:04}:{X:08}  {X:02}\n", .{ i, entry.cs, entry.eip, entry.opcode });
+                }
+            }
+        }
+        std.debug.print("=====================================\n", .{});
     }
 
     /// Check if CPU is halted
@@ -153,8 +220,71 @@ pub const Cpu = struct {
     pub fn getEffectiveAddress(self: *const Self, segment: u16, offset: u32) u32 {
         return switch (self.mode) {
             .real, .vm86 => (@as(u32, segment) << 4) + (offset & 0xFFFF),
-            .protected => offset, // Simplified - should use segment descriptors
+            .protected => {
+                // In protected mode, use segment descriptor base
+                const seg_index = self.getSegmentIndex(segment);
+                if (seg_index) |idx| {
+                    return self.seg_cache[idx].base +% offset;
+                }
+                return offset; // Fallback for invalid segment
+            },
         };
+    }
+
+    /// Get segment cache index from segment register value
+    fn getSegmentIndex(self: *const Self, segment: u16) ?usize {
+        if (segment == self.segments.es) return 0;
+        if (segment == self.segments.cs) return 1;
+        if (segment == self.segments.ss) return 2;
+        if (segment == self.segments.ds) return 3;
+        if (segment == self.segments.fs) return 4;
+        if (segment == self.segments.gs) return 5;
+        return null;
+    }
+
+    /// Load segment descriptor from GDT/LDT into cache
+    pub fn loadSegmentDescriptor(self: *Self, selector: u16, cache_index: usize) !void {
+        if (selector == 0) {
+            // Null selector - create null descriptor
+            self.seg_cache[cache_index] = SegmentDescriptor.fromBytes([8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+            return;
+        }
+
+        // Get descriptor table base and limit
+        const ti = (selector >> 2) & 1; // Table indicator: 0 = GDT, 1 = LDT
+        const index = selector >> 3; // Descriptor index
+        const dtr = if (ti == 0) self.system.gdtr else self.system.gdtr; // TODO: LDT support
+
+        // Check if index is within table limit
+        const offset = @as(u32, index) * 8;
+        if (offset + 7 > dtr.limit) {
+            return CpuError.GeneralProtectionFault;
+        }
+
+        // Read 8-byte descriptor from memory
+        var bytes: [8]u8 = undefined;
+        for (0..8) |i| {
+            bytes[i] = try self.mem.readByte(dtr.base + offset + @as(u32, @intCast(i)));
+        }
+
+        self.seg_cache[cache_index] = SegmentDescriptor.fromBytes(bytes);
+
+        // Check if segment is present
+        if (!self.seg_cache[cache_index].isPresent() and selector != 0) {
+            return CpuError.SegmentNotPresent;
+        }
+    }
+
+    /// Switch to protected mode
+    pub fn enterProtectedMode(self: *Self) void {
+        self.mode = .protected;
+        self.system.cr0.pe = true;
+    }
+
+    /// Switch back to real mode
+    pub fn enterRealMode(self: *Self) void {
+        self.mode = .real;
+        self.system.cr0.pe = false;
     }
 
     /// Get current code address
@@ -191,6 +321,10 @@ pub const Cpu = struct {
         }
 
         self.prefix.reset();
+
+        // Save current instruction position for history
+        self.current_instr_eip = self.eip;
+        self.current_instr_cs = self.segments.cs;
 
         // Decode and execute instruction
         try self.decodeAndExecute();

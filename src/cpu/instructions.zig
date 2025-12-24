@@ -26,6 +26,9 @@ fn decodeModRM(byte: u8) ModRM {
 
 /// Execute instruction based on opcode
 pub fn execute(cpu: *Cpu, opcode: u8) !void {
+    // Record instruction in history
+    cpu.recordInstruction(opcode, 0, false);
+
     switch (opcode) {
         // NOP
         0x90 => {},
@@ -121,6 +124,108 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
                 const imm = try fetchDword(cpu);
                 const result = addWithFlags32(cpu, cpu.regs.eax, imm);
                 cpu.regs.eax = result;
+            }
+        },
+
+        // OR AL, imm8
+        0x0C => {
+            const imm = try fetchByte(cpu);
+            const result = @as(u8, @truncate(cpu.regs.eax)) | imm;
+            cpu.flags.updateArithmetic8(result, false, false);
+            cpu.regs.setReg8(0, result);
+        },
+
+        // OR EAX, imm32
+        0x0D => {
+            if (cpu.prefix.operand_size_override) {
+                const imm = try fetchWord(cpu);
+                const result = @as(u16, @truncate(cpu.regs.eax)) | imm;
+                cpu.flags.updateArithmetic16(result, false, false);
+                cpu.regs.setReg16(0, result);
+            } else {
+                const imm = try fetchDword(cpu);
+                const result = cpu.regs.eax | imm;
+                cpu.flags.updateArithmetic32(result, false, false);
+                cpu.regs.eax = result;
+            }
+        },
+
+        // OR r/m8, r8
+        0x08 => {
+            const modrm = try fetchModRM(cpu);
+            const dst = try readRM8(cpu, modrm);
+            const src = cpu.regs.getReg8(modrm.reg);
+            const result = dst | src;
+            cpu.flags.updateArithmetic8(result, false, false);
+            try writeRM8(cpu, modrm, result);
+        },
+
+        // OR r/m32, r32
+        0x09 => {
+            const modrm = try fetchModRM(cpu);
+            if (cpu.prefix.operand_size_override) {
+                const dst = try readRM16(cpu, modrm);
+                const src = cpu.regs.getReg16(modrm.reg);
+                const result = dst | src;
+                cpu.flags.updateArithmetic16(result, false, false);
+                try writeRM16(cpu, modrm, result);
+            } else {
+                const dst = try readRM32(cpu, modrm);
+                const src = cpu.regs.getReg32(modrm.reg);
+                const result = dst | src;
+                cpu.flags.updateArithmetic32(result, false, false);
+                try writeRM32(cpu, modrm, result);
+            }
+        },
+
+        // AND AL, imm8
+        0x24 => {
+            const imm = try fetchByte(cpu);
+            const result = @as(u8, @truncate(cpu.regs.eax)) & imm;
+            cpu.flags.updateArithmetic8(result, false, false);
+            cpu.regs.setReg8(0, result);
+        },
+
+        // AND EAX, imm32
+        0x25 => {
+            if (cpu.prefix.operand_size_override) {
+                const imm = try fetchWord(cpu);
+                const result = @as(u16, @truncate(cpu.regs.eax)) & imm;
+                cpu.flags.updateArithmetic16(result, false, false);
+                cpu.regs.setReg16(0, result);
+            } else {
+                const imm = try fetchDword(cpu);
+                const result = cpu.regs.eax & imm;
+                cpu.flags.updateArithmetic32(result, false, false);
+                cpu.regs.eax = result;
+            }
+        },
+
+        // AND r/m8, r8
+        0x20 => {
+            const modrm = try fetchModRM(cpu);
+            const dst = try readRM8(cpu, modrm);
+            const src = cpu.regs.getReg8(modrm.reg);
+            const result = dst & src;
+            cpu.flags.updateArithmetic8(result, false, false);
+            try writeRM8(cpu, modrm, result);
+        },
+
+        // AND r/m32, r32
+        0x21 => {
+            const modrm = try fetchModRM(cpu);
+            if (cpu.prefix.operand_size_override) {
+                const dst = try readRM16(cpu, modrm);
+                const src = cpu.regs.getReg16(modrm.reg);
+                const result = dst & src;
+                cpu.flags.updateArithmetic16(result, false, false);
+                try writeRM16(cpu, modrm, result);
+            } else {
+                const dst = try readRM32(cpu, modrm);
+                const src = cpu.regs.getReg32(modrm.reg);
+                const result = dst & src;
+                cpu.flags.updateArithmetic32(result, false, false);
+                try writeRM32(cpu, modrm, result);
             }
         },
 
@@ -324,6 +429,9 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
         // Two-byte opcodes (0F prefix)
         0x0F => {
             const opcode2 = try fetchByte(cpu);
+            // Update history with full two-byte opcode
+            cpu.instr_history[(cpu.instr_history_pos + 31) % 32].opcode2 = opcode2;
+            cpu.instr_history[(cpu.instr_history_pos + 31) % 32].is_two_byte = true;
             try executeTwoByteOpcode(cpu, opcode2);
         },
 
@@ -333,7 +441,11 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
         },
 
         else => {
-            return CpuError.InvalidOpcode;
+            cpu.dumpInstructionHistory();
+            std.debug.print("\nINVALID OPCODE: {X:02} at {X:04}:{X:08}\n", .{ opcode, cpu.current_instr_cs, cpu.current_instr_eip });
+            std.debug.print("Registers: EAX={X:08} EBX={X:08} ECX={X:08} EDX={X:08}\n", .{ cpu.regs.eax, cpu.regs.ebx, cpu.regs.ecx, cpu.regs.edx });
+            std.debug.print("           ESP={X:08} EBP={X:08} ESI={X:08} EDI={X:08}\n", .{ cpu.regs.esp, cpu.regs.ebp, cpu.regs.esi, cpu.regs.edi });
+            @panic("Unhandled opcode");
         },
     }
 }
@@ -391,8 +503,133 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
             cpu.regs.edx = @truncate(tsc >> 32);
         },
 
+        // Group 7 (LGDT, LIDT, etc.)
+        0x01 => {
+            try executeGroup7(cpu);
+        },
+
+        // MOV r32, CRn
+        0x20 => {
+            const modrm = try fetchModRM(cpu);
+            const value = switch (modrm.reg) {
+                0 => cpu.system.cr0.toU32(),
+                2 => cpu.system.cr2,
+                3 => cpu.system.cr3.toU32(),
+                4 => cpu.system.cr4.toU32(),
+                else => return CpuError.InvalidOpcode,
+            };
+            cpu.regs.setReg32(modrm.rm, value);
+        },
+
+        // MOV CRn, r32
+        0x22 => {
+            const modrm = try fetchModRM(cpu);
+            const value = cpu.regs.getReg32(modrm.rm);
+            switch (modrm.reg) {
+                0 => {
+                    const old_pe = cpu.system.cr0.pe;
+                    cpu.system.cr0 = cpu_mod.CR0.fromU32(value);
+                    // Handle mode switch
+                    if (!old_pe and cpu.system.cr0.pe) {
+                        cpu.mode = .protected;
+                    } else if (old_pe and !cpu.system.cr0.pe) {
+                        cpu.mode = .real;
+                    }
+                },
+                2 => cpu.system.cr2 = value,
+                3 => cpu.system.cr3 = cpu_mod.CR3.fromU32(value),
+                4 => cpu.system.cr4 = cpu_mod.CR4.fromU32(value),
+                else => return CpuError.InvalidOpcode,
+            }
+        },
+
+        // WBINVD (Write-Back and Invalidate Cache)
+        0x09 => {
+            // No-op for emulator (no cache to invalidate)
+        },
+
+        // INVD (Invalidate Cache)
+        0x08 => {
+            // No-op for emulator
+        },
+
         else => {
-            return CpuError.InvalidOpcode;
+            cpu.dumpInstructionHistory();
+            std.debug.print("\nINVALID TWO-BYTE OPCODE: 0F {X:02} at {X:04}:{X:08}\n", .{ opcode, cpu.current_instr_cs, cpu.current_instr_eip });
+            std.debug.print("Registers: EAX={X:08} EBX={X:08} ECX={X:08} EDX={X:08}\n", .{ cpu.regs.eax, cpu.regs.ebx, cpu.regs.ecx, cpu.regs.edx });
+            @panic("Unhandled two-byte opcode");
+        },
+    }
+}
+
+/// Execute Group 7 instructions (LGDT, LIDT, SGDT, SIDT, etc.)
+fn executeGroup7(cpu: *Cpu) !void {
+    const modrm = try fetchModRM(cpu);
+
+    switch (modrm.reg) {
+        // SGDT - Store Global Descriptor Table Register
+        0 => {
+            const addr = try calculateEffectiveAddress(cpu, modrm);
+            try cpu.mem.writeWord(addr, cpu.system.gdtr.limit);
+            try cpu.mem.writeDword(addr + 2, cpu.system.gdtr.base);
+        },
+        // SIDT - Store Interrupt Descriptor Table Register
+        1 => {
+            const addr = try calculateEffectiveAddress(cpu, modrm);
+            try cpu.mem.writeWord(addr, cpu.system.idtr.limit);
+            try cpu.mem.writeDword(addr + 2, cpu.system.idtr.base);
+        },
+        // LGDT - Load Global Descriptor Table Register
+        2 => {
+            const addr = try calculateEffectiveAddress(cpu, modrm);
+            cpu.system.gdtr.limit = try cpu.mem.readWord(addr);
+            cpu.system.gdtr.base = try cpu.mem.readDword(addr + 2);
+        },
+        // LIDT - Load Interrupt Descriptor Table Register
+        3 => {
+            const addr = try calculateEffectiveAddress(cpu, modrm);
+            cpu.system.idtr.limit = try cpu.mem.readWord(addr);
+            cpu.system.idtr.base = try cpu.mem.readDword(addr + 2);
+        },
+        // SMSW - Store Machine Status Word
+        4 => {
+            const value: u16 = @truncate(cpu.system.cr0.toU32());
+            if (modrm.mod == 3) {
+                cpu.regs.setReg16(modrm.rm, value);
+            } else {
+                const addr = try calculateEffectiveAddress(cpu, modrm);
+                try cpu.mem.writeWord(addr, value);
+            }
+        },
+        // LMSW - Load Machine Status Word
+        6 => {
+            var value: u16 = undefined;
+            if (modrm.mod == 3) {
+                value = cpu.regs.getReg16(modrm.rm);
+            } else {
+                const addr = try calculateEffectiveAddress(cpu, modrm);
+                value = try cpu.mem.readWord(addr);
+            }
+            // LMSW can only set PE, not clear it
+            var cr0 = cpu.system.cr0;
+            if (value & 1 != 0) {
+                cr0.pe = true;
+                cpu.mode = .protected;
+            }
+            cr0.mp = (value & 2) != 0;
+            cr0.em = (value & 4) != 0;
+            cr0.ts = (value & 8) != 0;
+            cpu.system.cr0 = cr0;
+        },
+        // INVLPG - Invalidate TLB Entry
+        7 => {
+            // No-op for emulator (no TLB)
+            _ = try calculateEffectiveAddress(cpu, modrm);
+        },
+        else => {
+            cpu.dumpInstructionHistory();
+            std.debug.print("\nINVALID GROUP 7 INSTRUCTION: 0F 01 /{d} at {X:04}:{X:08}\n", .{ modrm.reg, cpu.current_instr_cs, cpu.current_instr_eip });
+            @panic("Unhandled Group 7 instruction");
         },
     }
 }

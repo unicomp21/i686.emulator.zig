@@ -95,7 +95,7 @@ docker run --rm i686-emu-test
 
 ### Test Status
 
-All tests currently pass (57/57):
+All tests currently pass (68/68):
 
 | Test Suite | Tests | Status |
 |------------|-------|--------|
@@ -107,7 +107,8 @@ All tests currently pass (57/57):
 | Event Queue | 4 | ✓ Pass |
 | CPU (via root) | 4 | ✓ Pass |
 | I/O (via root) | 2 | ✓ Pass |
-| Integration | 6 | ✓ Pass |
+| Protected Mode | 5 | ✓ Pass |
+| Integration | 9 | ✓ Pass |
 
 ### Test Categories
 
@@ -116,6 +117,7 @@ All tests currently pass (57/57):
 | CPU | `src/cpu/cpu.zig` | CPU initialization, reset, state |
 | Registers | `src/cpu/registers.zig` | 8/16/32-bit register access, flags |
 | Instructions | `src/cpu/instructions.zig` | Individual instruction execution |
+| Protected Mode | `src/cpu/protected_mode.zig` | GDT/IDT, CR0-CR4, segment descriptors |
 | Memory | `src/memory/memory.zig` | Read/write, bounds checking |
 | I/O | `src/io/io.zig` | Port mapping, UART registration |
 | UART | `src/io/uart.zig` | Serial I/O, register access |
@@ -178,6 +180,9 @@ Current integration tests:
 - **call and return**: CALL/RET stack operations
 - **register preservation**: PUSH/POP register save/restore
 - **xor zero**: XOR r,r to zero register
+- **protected mode**: LGDT + CR0.PE mode switch
+- **lidt**: Load Interrupt Descriptor Table
+- **mov cr0**: Control register read/write
 
 ## Key Modules
 
@@ -455,25 +460,46 @@ The long-term goal is running Linux kernel self-tests. Current progress:
 | Component | Status | Notes |
 |-----------|--------|-------|
 | Real mode | ✓ Done | Segment * 16 + offset addressing |
-| Basic instructions | ✓ Done | MOV, PUSH/POP, ADD/SUB, JMP, CALL/RET |
+| Basic instructions | ✓ Done | MOV, PUSH/POP, ADD/SUB, JMP, CALL/RET, OR, AND, XOR |
 | UART I/O | ✓ Done | 16550A for test output |
 | Event system | ✓ Done | Async queue + epoll event loop |
-| Protected mode | ☐ TODO | Required for Linux |
+| Protected mode | ✓ Done | GDT/IDT, CR0-CR4, mode switching |
 | Paging | ☐ TODO | Required for Linux |
 | System calls | ☐ TODO | INT 0x80 / SYSENTER |
-| Full instruction set | ☐ TODO | ~300 more opcodes |
+| Full instruction set | ☐ TODO | ~250 more opcodes |
+
+### Protected Mode Support
+
+The emulator now supports protected mode with:
+
+- **GDT/IDT**: LGDT, LIDT, SGDT, SIDT instructions
+- **Control Registers**: CR0, CR2, CR3, CR4 (MOV to/from)
+- **Mode Switching**: PE bit in CR0 enables protected mode
+- **Segment Descriptors**: Full parsing of base, limit, access, flags
+- **LMSW/SMSW**: Load/Store Machine Status Word
+
+Example protected mode switch:
+```zig
+const code = [_]u8{
+    0x0F, 0x01, 0x15, 0xF6, 0x0F, 0x00, 0x00, // lgdt [0x0FF6]
+    0x0F, 0x20, 0xC0,                         // mov eax, cr0
+    0x0C, 0x01,                               // or al, 1
+    0x0F, 0x22, 0xC0,                         // mov cr0, eax
+    // Now in protected mode
+};
+```
 
 ### Priority Features for kselftest
 
-1. **Protected Mode**
-   - GDT/LDT support
-   - Segment descriptor parsing
-   - Privilege level handling
+1. **Paging**
+   - Page directory/table parsing
+   - CR3 page directory base
+   - Page fault (#PF) handling
 
-2. **System Instructions**
-   - LGDT, LIDT, LLDT
-   - MOV to/from control registers
+2. **More System Instructions**
    - SYSENTER/SYSEXIT
+   - LLDT, LTR (task register)
+   - IRET (interrupt return)
 
 3. **Memory Management**
    - Paging support (CR0, CR3, page tables)
