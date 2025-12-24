@@ -41,6 +41,8 @@ pub const Config = struct {
     enable_uart: bool = true,
     /// UART base address
     uart_base: u16 = 0x3F8,
+    /// Enable keyboard controller (8042)
+    enable_keyboard: bool = false,
     /// Enable debug mode
     debug_mode: bool = false,
     /// Initial instruction pointer
@@ -71,6 +73,10 @@ pub const Emulator = struct {
 
         if (config.enable_uart) {
             try io_ctrl.registerUart(config.uart_base);
+        }
+
+        if (config.enable_keyboard) {
+            io_ctrl.registerKeyboard();
         }
 
         // Create CPU with temporary pointers (will be fixed after struct is in final location)
@@ -135,6 +141,20 @@ pub const Emulator = struct {
     pub fn sendUartInput(self: *Self, data: []const u8) !void {
         if (self.io_ctrl.getUart(self.config.uart_base)) |u| {
             try u.sendInput(data);
+        }
+    }
+
+    /// Queue keyboard scan code (for testing)
+    pub fn queueKeyScanCode(self: *Self, scancode: u8) !void {
+        if (self.io_ctrl.getKeyboard()) |kbd| {
+            try kbd.queueScanCode(scancode);
+        }
+    }
+
+    /// Queue multiple keyboard scan codes (for testing)
+    pub fn queueKeyScanCodes(self: *Self, scancodes: []const u8) !void {
+        if (self.io_ctrl.getKeyboard()) |kbd| {
+            try kbd.queueScanCodes(scancodes);
         }
     }
 

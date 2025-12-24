@@ -451,6 +451,12 @@ pub const SystemRegisters = struct {
     cr3: CR3,
     /// Control Register 4
     cr4: CR4,
+    /// Model Specific Register: IA32_SYSENTER_CS (0x174)
+    msr_sysenter_cs: u32,
+    /// Model Specific Register: IA32_SYSENTER_ESP (0x175)
+    msr_sysenter_esp: u32,
+    /// Model Specific Register: IA32_SYSENTER_EIP (0x176)
+    msr_sysenter_eip: u32,
 
     const Self = @This();
 
@@ -464,6 +470,9 @@ pub const SystemRegisters = struct {
             .cr2 = 0,
             .cr3 = .{},
             .cr4 = .{},
+            .msr_sysenter_cs = 0,
+            .msr_sysenter_esp = 0,
+            .msr_sysenter_eip = 0,
         };
     }
 

@@ -606,6 +606,52 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             cpu.regs.esp +%= imm;
         },
 
+        // ENTER - High-level procedure entry (create stack frame)
+        0xC8 => {
+            const alloc_size = try fetchWord(cpu);
+            const nesting_level = @min(try fetchByte(cpu), 31);
+
+            if (cpu.prefix.operand_size_override) {
+                // 16-bit: ENTER imm16, imm8
+                const bp = cpu.regs.getReg16(5);
+                try cpu.push16(bp);
+                const frame_ptr = cpu.regs.getReg16(4); // sp
+
+                if (nesting_level > 0) {
+                    var level: u8 = 1;
+                    while (level < nesting_level) : (level += 1) {
+                        const offset = @as(u16, level) *% 2;
+                        const addr = cpu.getEffectiveAddress(cpu.segments.ss, @as(u32, bp -% offset));
+                        const value = try cpu.readMemWord(addr);
+                        try cpu.push16(value);
+                    }
+                    try cpu.push16(frame_ptr);
+                }
+
+                cpu.regs.setReg16(5, frame_ptr); // bp = frame_ptr
+                cpu.regs.setReg16(4, cpu.regs.getReg16(4) -% alloc_size); // sp -= alloc_size
+            } else {
+                // 32-bit: ENTER imm16, imm8
+                const ebp = cpu.regs.ebp;
+                try cpu.push(ebp);
+                const frame_ptr = cpu.regs.esp;
+
+                if (nesting_level > 0) {
+                    var level: u8 = 1;
+                    while (level < nesting_level) : (level += 1) {
+                        const offset = @as(u32, level) *% 4;
+                        const addr = cpu.getEffectiveAddress(cpu.segments.ss, ebp -% offset);
+                        const value = try cpu.readMemDword(addr);
+                        try cpu.push(value);
+                    }
+                    try cpu.push(frame_ptr);
+                }
+
+                cpu.regs.ebp = frame_ptr;
+                cpu.regs.esp -%= alloc_size;
+            }
+        },
+
         // LEAVE - High-level procedure exit (mov esp, ebp; pop ebp)
         0xC9 => {
             if (cpu.prefix.operand_size_override) {
@@ -854,6 +900,96 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
             const tsc = cpu.cycles;
             cpu.regs.eax = @truncate(tsc);
             cpu.regs.edx = @truncate(tsc >> 32);
+        },
+
+        // WRMSR - Write to Model Specific Register
+        0x30 => {
+            const msr_index = cpu.regs.ecx;
+            const value = (@as(u64, cpu.regs.edx) << 32) | cpu.regs.eax;
+            switch (msr_index) {
+                0x174 => cpu.system.msr_sysenter_cs = @truncate(value),
+                0x175 => cpu.system.msr_sysenter_esp = @truncate(value),
+                0x176 => cpu.system.msr_sysenter_eip = @truncate(value),
+                else => {
+                    // For unsupported MSRs, we just ignore writes (or could raise #GP)
+                    // Real hardware would raise #GP(0) for unknown MSRs
+                },
+            }
+        },
+
+        // RDMSR - Read from Model Specific Register
+        0x32 => {
+            const msr_index = cpu.regs.ecx;
+            const value: u64 = switch (msr_index) {
+                0x174 => cpu.system.msr_sysenter_cs,
+                0x175 => cpu.system.msr_sysenter_esp,
+                0x176 => cpu.system.msr_sysenter_eip,
+                else => 0, // For unsupported MSRs, return 0 (or could raise #GP)
+            };
+            cpu.regs.eax = @truncate(value);
+            cpu.regs.edx = @truncate(value >> 32);
+        },
+
+        // SYSENTER - Fast System Call
+        0x34 => {
+            // SYSENTER behavior (Intel specification):
+            // 1. Load CS from IA32_SYSENTER_CS (selector with RPL forced to 0)
+            // 2. Load SS from IA32_SYSENTER_CS + 8
+            // 3. Load ESP from IA32_SYSENTER_ESP
+            // 4. Load EIP from IA32_SYSENTER_EIP
+            // 5. Clear VM flag in EFLAGS
+            // 6. CPL becomes 0 (kernel mode)
+
+            const sysenter_cs = cpu.system.msr_sysenter_cs & 0xFFFC; // Clear RPL bits
+
+            // Load CS (kernel code segment, RPL=0)
+            cpu.segments.cs = @truncate(sysenter_cs);
+
+            // Load SS (kernel data segment, RPL=0)
+            // SS = CS + 8 per Intel spec
+            cpu.segments.ss = @truncate(sysenter_cs + 8);
+
+            // Load ESP
+            cpu.regs.esp = cpu.system.msr_sysenter_esp;
+
+            // Load EIP
+            cpu.eip = cpu.system.msr_sysenter_eip;
+
+            // Clear VM flag (if we supported VM86 mode)
+            // For now, we just ensure we're in protected mode
+            if (cpu.mode != .protected) {
+                cpu.mode = .protected;
+            }
+
+            // Note: CPL becomes 0 (kernel mode) - tracked in segment selectors' RPL
+        },
+
+        // SYSEXIT - Fast Return from System Call
+        0x35 => {
+            // SYSEXIT behavior (Intel specification):
+            // 1. Load CS from IA32_SYSENTER_CS + 16 (selector with RPL forced to 3)
+            // 2. Load SS from IA32_SYSENTER_CS + 24 (selector with RPL forced to 3)
+            // 3. Load ESP from ECX
+            // 4. Load EIP from EDX
+            // 5. CPL becomes 3 (user mode)
+
+            const sysenter_cs = cpu.system.msr_sysenter_cs & 0xFFFC; // Clear RPL bits
+
+            // Load CS (user code segment, RPL=3)
+            // CS = CS_BASE + 16 + 3 (RPL=3 for user mode)
+            cpu.segments.cs = @truncate(sysenter_cs + 16 + 3);
+
+            // Load SS (user data segment, RPL=3)
+            // SS = CS_BASE + 24 + 3
+            cpu.segments.ss = @truncate(sysenter_cs + 24 + 3);
+
+            // Load ESP from ECX
+            cpu.regs.esp = cpu.regs.ecx;
+
+            // Load EIP from EDX
+            cpu.eip = cpu.regs.edx;
+
+            // Note: CPL becomes 3 (user mode) - tracked in segment selectors' RPL
         },
 
         // Group 7 (LGDT, LIDT, etc.)
@@ -2156,4 +2292,391 @@ test "mov immediate instructions" {
     try cpu.step();
 
     try std.testing.expectEqual(@as(u8, 0x42), @as(u8, @truncate(cpu.regs.eax)));
+}
+
+test "enter instruction: simple (0, 0)" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.regs.esp = 0x1000;
+    cpu.regs.ebp = 0x2000;
+
+    // ENTER 0, 0 (0xC8, 0x00, 0x00, 0x00)
+    try mem.writeByte(0, 0xC8);
+    try mem.writeByte(1, 0x00); // alloc_size low byte
+    try mem.writeByte(2, 0x00); // alloc_size high byte
+    try mem.writeByte(3, 0x00); // nesting_level
+
+    const initial_esp = cpu.regs.esp;
+    const initial_ebp = cpu.regs.ebp;
+
+    try cpu.step();
+
+    // ENTER 0, 0 should:
+    // 1. Push EBP (esp -= 4)
+    // 2. Set EBP = ESP (frame pointer)
+    // 3. ESP -= 0 (no local space)
+    try std.testing.expectEqual(initial_esp - 4, cpu.regs.ebp);
+    try std.testing.expectEqual(initial_esp - 4, cpu.regs.esp);
+
+    // Verify old EBP was pushed
+    const pushed_ebp = try mem.readDword(cpu.regs.esp);
+    try std.testing.expectEqual(initial_ebp, pushed_ebp);
+}
+
+test "enter instruction: with local space (16, 0)" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.regs.esp = 0x1000;
+    cpu.regs.ebp = 0x2000;
+
+    // ENTER 16, 0 (0xC8, 0x10, 0x00, 0x00)
+    try mem.writeByte(0, 0xC8);
+    try mem.writeByte(1, 0x10); // alloc_size low byte (16)
+    try mem.writeByte(2, 0x00); // alloc_size high byte
+    try mem.writeByte(3, 0x00); // nesting_level
+
+    const initial_esp = cpu.regs.esp;
+    const initial_ebp = cpu.regs.ebp;
+
+    try cpu.step();
+
+    // ENTER 16, 0 should:
+    // 1. Push EBP (esp -= 4)
+    // 2. Set EBP = ESP (frame pointer)
+    // 3. ESP -= 16 (allocate 16 bytes local space)
+    try std.testing.expectEqual(initial_esp - 4, cpu.regs.ebp);
+    try std.testing.expectEqual(initial_esp - 4 - 16, cpu.regs.esp);
+
+    // Verify old EBP was pushed
+    const pushed_ebp = try mem.readDword(cpu.regs.ebp);
+    try std.testing.expectEqual(initial_ebp, pushed_ebp);
+}
+
+test "enter instruction: with nesting (8, 1)" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.regs.esp = 0x1000;
+    cpu.regs.ebp = 0x2000;
+
+    // ENTER 8, 1 (0xC8, 0x08, 0x00, 0x01)
+    try mem.writeByte(0, 0xC8);
+    try mem.writeByte(1, 0x08); // alloc_size low byte (8)
+    try mem.writeByte(2, 0x00); // alloc_size high byte
+    try mem.writeByte(3, 0x01); // nesting_level = 1
+
+    const initial_esp = cpu.regs.esp;
+    const initial_ebp = cpu.regs.ebp;
+
+    try cpu.step();
+
+    // ENTER 8, 1 should:
+    // 1. Push EBP (esp -= 4)                           esp = 0xFFC
+    // 2. frame_ptr = ESP                               frame_ptr = 0xFFC
+    // 3. Since nesting_level = 1, no additional pushes in the loop (level < 1 is false)
+    // 4. Push frame_ptr (esp -= 4)                     esp = 0xFF8
+    // 5. Set EBP = frame_ptr                           ebp = 0xFFC
+    // 6. ESP -= 8 (allocate 8 bytes local space)      esp = 0xFF0
+
+    try std.testing.expectEqual(initial_esp - 4, cpu.regs.ebp); // EBP = frame_ptr
+    try std.testing.expectEqual(initial_esp - 4 - 4 - 8, cpu.regs.esp); // ESP after push + alloc
+
+    // Verify old EBP was pushed at the top
+    const pushed_ebp = try mem.readDword(cpu.regs.ebp);
+    try std.testing.expectEqual(initial_ebp, pushed_ebp);
+
+    // Verify frame_ptr was pushed (should be at ebp - 4)
+    const pushed_frame_ptr = try mem.readDword(cpu.regs.ebp - 4);
+    try std.testing.expectEqual(initial_esp - 4, pushed_frame_ptr);
+}
+
+test "enter and leave instruction pair" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.regs.esp = 0x1000;
+    cpu.regs.ebp = 0x2000;
+
+    // ENTER 16, 0 followed by LEAVE
+    try mem.writeByte(0, 0xC8); // ENTER
+    try mem.writeByte(1, 0x10); // alloc_size = 16
+    try mem.writeByte(2, 0x00);
+    try mem.writeByte(3, 0x00); // nesting_level = 0
+    try mem.writeByte(4, 0xC9); // LEAVE
+
+    const initial_esp = cpu.regs.esp;
+    const initial_ebp = cpu.regs.ebp;
+
+    // Execute ENTER
+    try cpu.step();
+
+    // Execute LEAVE
+    try cpu.step();
+
+    // After ENTER + LEAVE, we should be back to initial state
+    try std.testing.expectEqual(initial_esp, cpu.regs.esp);
+    try std.testing.expectEqual(initial_ebp, cpu.regs.ebp);
+}
+
+test "wrmsr and rdmsr instructions" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Write test values to MSRs using WRMSR
+    // Test IA32_SYSENTER_CS (0x174)
+    cpu.regs.ecx = 0x174; // MSR index
+    cpu.regs.eax = 0x12345678; // Low 32 bits
+    cpu.regs.edx = 0; // High 32 bits
+
+    // WRMSR: 0F 30
+    try mem.writeByte(0, 0x0F);
+    try mem.writeByte(1, 0x30);
+    try cpu.step();
+
+    // Verify the MSR was written
+    try std.testing.expectEqual(@as(u32, 0x12345678), cpu.system.msr_sysenter_cs);
+
+    // Reset EIP
+    cpu.eip = 2;
+
+    // Read back using RDMSR
+    cpu.regs.ecx = 0x174; // Same MSR index
+    cpu.regs.eax = 0; // Clear these
+    cpu.regs.edx = 0;
+
+    // RDMSR: 0F 32
+    try mem.writeByte(2, 0x0F);
+    try mem.writeByte(3, 0x32);
+    try cpu.step();
+
+    // Verify values were read correctly
+    try std.testing.expectEqual(@as(u32, 0x12345678), cpu.regs.eax);
+    try std.testing.expectEqual(@as(u32, 0), cpu.regs.edx);
+
+    // Test IA32_SYSENTER_ESP (0x175)
+    cpu.eip = 4;
+    cpu.regs.ecx = 0x175;
+    cpu.regs.eax = 0xABCDEF00;
+    cpu.regs.edx = 0;
+
+    try mem.writeByte(4, 0x0F);
+    try mem.writeByte(5, 0x30);
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u32, 0xABCDEF00), cpu.system.msr_sysenter_esp);
+
+    // Test IA32_SYSENTER_EIP (0x176)
+    cpu.eip = 6;
+    cpu.regs.ecx = 0x176;
+    cpu.regs.eax = 0x00C0FFEE;
+    cpu.regs.edx = 0;
+
+    try mem.writeByte(6, 0x0F);
+    try mem.writeByte(7, 0x30);
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u32, 0x00C0FFEE), cpu.system.msr_sysenter_eip);
+}
+
+test "sysenter instruction" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.mode = .protected; // SYSENTER requires protected mode
+
+    // Set up SYSENTER MSRs
+    cpu.system.msr_sysenter_cs = 0x0008; // Kernel code segment (selector 8)
+    cpu.system.msr_sysenter_esp = 0xC0000000; // Kernel stack
+    cpu.system.msr_sysenter_eip = 0x80000000; // Kernel entry point
+
+    // Set up initial user-mode state
+    cpu.segments.cs = 0x001B; // User code segment (RPL=3)
+    cpu.segments.ss = 0x0023; // User stack segment (RPL=3)
+    cpu.regs.esp = 0x7FFFFFFF; // User stack
+    cpu.eip = 0x1000; // User code
+
+    // SYSENTER: 0F 34
+    try mem.writeByte(0x1000, 0x0F);
+    try mem.writeByte(0x1001, 0x34);
+
+    try cpu.step();
+
+    // Verify SYSENTER behavior:
+    // 1. CS should be loaded from MSR (with RPL=0)
+    try std.testing.expectEqual(@as(u16, 0x0008), cpu.segments.cs);
+
+    // 2. SS should be CS + 8
+    try std.testing.expectEqual(@as(u16, 0x0010), cpu.segments.ss);
+
+    // 3. ESP should be loaded from MSR
+    try std.testing.expectEqual(@as(u32, 0xC0000000), cpu.regs.esp);
+
+    // 4. EIP should be loaded from MSR
+    try std.testing.expectEqual(@as(u32, 0x80000000), cpu.eip);
+
+    // 5. Should be in protected mode
+    try std.testing.expectEqual(cpu_mod.CpuMode.protected, cpu.mode);
+}
+
+test "sysexit instruction" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.mode = .protected;
+
+    // Set up SYSENTER MSR (needed for SYSEXIT calculation)
+    cpu.system.msr_sysenter_cs = 0x0008; // Kernel code segment
+
+    // Set up kernel mode state
+    cpu.segments.cs = 0x0008; // Kernel code segment (RPL=0)
+    cpu.segments.ss = 0x0010; // Kernel stack segment (RPL=0)
+    cpu.regs.esp = 0xC0000000; // Kernel stack
+    cpu.eip = 0x80001000; // Kernel code
+
+    // Set return addresses in ECX (ESP) and EDX (EIP)
+    cpu.regs.ecx = 0x7FFFFFFF; // User stack to return to
+    cpu.regs.edx = 0x00401000; // User code to return to
+
+    // SYSEXIT: 0F 35
+    try mem.writeByte(0, 0x0F);
+    try mem.writeByte(1, 0x35);
+    cpu.eip = 0; // Reset to execute our instruction
+
+    try cpu.step();
+
+    // Verify SYSEXIT behavior:
+    // 1. CS should be MSR_CS + 16 + 3 (RPL=3)
+    // 0x0008 + 16 + 3 = 0x001B
+    try std.testing.expectEqual(@as(u16, 0x001B), cpu.segments.cs);
+
+    // 2. SS should be MSR_CS + 24 + 3 (RPL=3)
+    // 0x0008 + 24 + 3 = 0x0023
+    try std.testing.expectEqual(@as(u16, 0x0023), cpu.segments.ss);
+
+    // 3. ESP should be loaded from ECX
+    try std.testing.expectEqual(@as(u32, 0x7FFFFFFF), cpu.regs.esp);
+
+    // 4. EIP should be loaded from EDX
+    try std.testing.expectEqual(@as(u32, 0x00401000), cpu.eip);
+}
+
+test "sysenter and sysexit round trip" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.mode = .protected;
+
+    // Configure MSRs
+    cpu.system.msr_sysenter_cs = 0x0008;
+    cpu.system.msr_sysenter_esp = 0xC0000000;
+    cpu.system.msr_sysenter_eip = 0x80000000;
+
+    // User mode initial state
+    const user_cs: u16 = 0x001B;
+    const user_ss: u16 = 0x0023;
+    const user_esp: u32 = 0x7FFFFFFF;
+    const user_eip: u32 = 0x1000;
+
+    cpu.segments.cs = user_cs;
+    cpu.segments.ss = user_ss;
+    cpu.regs.esp = user_esp;
+
+    // Write SYSENTER at user code location
+    try mem.writeByte(user_eip, 0x0F);
+    try mem.writeByte(user_eip + 1, 0x34);
+
+    // Write SYSEXIT at kernel entry point
+    // Kernel needs to set up ECX/EDX with return addresses first
+    try mem.writeByte(0x80000000, 0xB9); // MOV ECX, imm32
+    try mem.writeDword(0x80000001, user_esp); // User ESP
+    try mem.writeByte(0x80000005, 0xBA); // MOV EDX, imm32
+    try mem.writeDword(0x80000006, user_eip + 2); // User EIP (after SYSENTER)
+    try mem.writeByte(0x8000000A, 0x0F); // SYSEXIT
+    try mem.writeByte(0x8000000B, 0x35);
+
+    cpu.eip = user_eip;
+
+    // Execute SYSENTER
+    try cpu.step();
+
+    // Verify we're in kernel mode
+    try std.testing.expectEqual(@as(u16, 0x0008), cpu.segments.cs);
+    try std.testing.expectEqual(@as(u32, 0xC0000000), cpu.regs.esp);
+    try std.testing.expectEqual(@as(u32, 0x80000000), cpu.eip);
+
+    // Execute kernel code: MOV ECX, user_esp
+    try cpu.step();
+    try std.testing.expectEqual(user_esp, cpu.regs.ecx);
+
+    // Execute: MOV EDX, user_eip + 2
+    try cpu.step();
+    try std.testing.expectEqual(user_eip + 2, cpu.regs.edx);
+
+    // Execute SYSEXIT
+    try cpu.step();
+
+    // Verify we're back in user mode
+    try std.testing.expectEqual(user_cs, cpu.segments.cs);
+    try std.testing.expectEqual(user_ss, cpu.segments.ss);
+    try std.testing.expectEqual(user_esp, cpu.regs.esp);
+    try std.testing.expectEqual(user_eip + 2, cpu.eip); // After SYSENTER instruction
 }

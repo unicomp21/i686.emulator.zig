@@ -1094,3 +1094,164 @@ test "integration: int 0x80 with iret" {
     try std.testing.expect(output != null);
     try std.testing.expectEqualStrings("IR", output.?);
 }
+
+test "integration: rdmsr and wrmsr" {
+    const allocator = std.testing.allocator;
+
+    // Program to write and read MSRs
+    const program = [_]u8{
+        // Write to IA32_SYSENTER_CS (0x174)
+        // mov ecx, 0x174
+        0xB9, 0x74, 0x01, 0x00, 0x00,
+        // mov eax, 0x00000008 (CS selector value)
+        0xB8, 0x08, 0x00, 0x00, 0x00,
+        // mov edx, 0
+        0xBA, 0x00, 0x00, 0x00, 0x00,
+        // wrmsr
+        0x0F, 0x30,
+
+        // Write to IA32_SYSENTER_ESP (0x175)
+        // mov ecx, 0x175
+        0xB9, 0x75, 0x01, 0x00, 0x00,
+        // mov eax, 0xC0000000 (kernel stack)
+        0xB8, 0x00, 0x00, 0x00, 0xC0,
+        // wrmsr
+        0x0F, 0x30,
+
+        // Write to IA32_SYSENTER_EIP (0x176)
+        // mov ecx, 0x176
+        0xB9, 0x76, 0x01, 0x00, 0x00,
+        // mov eax, 0x80000000 (kernel entry)
+        0xB8, 0x00, 0x00, 0x00, 0x80,
+        // wrmsr
+        0x0F, 0x30,
+
+        // Read back IA32_SYSENTER_CS and verify
+        // mov ecx, 0x174
+        0xB9, 0x74, 0x01, 0x00, 0x00,
+        // rdmsr
+        0x0F, 0x32,
+        // eax should now be 0x00000008
+        // Compare with expected value
+        // cmp eax, 0x00000008
+        0x3D, 0x08, 0x00, 0x00, 0x00,
+        // jne skip (skip UART output if not equal)
+        0x75, 0x0D,
+
+        // Output 'M' for MSR success
+        // mov edx, 0x3F8
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        // mov al, 'M'
+        0xB0, 'M',
+        // out dx, al
+        0xEE,
+
+        // hlt
+        0xF4,
+    };
+
+    var emu = try Emulator.init(allocator, .{ .enable_uart = true });
+    defer emu.deinit();
+
+    try emu.loadBinary(&program, 0);
+    try emu.run();
+
+    // Verify MSR values were written
+    try std.testing.expectEqual(@as(u32, 0x00000008), emu.cpu_instance.system.msr_sysenter_cs);
+    try std.testing.expectEqual(@as(u32, 0xC0000000), emu.cpu_instance.system.msr_sysenter_esp);
+    try std.testing.expectEqual(@as(u32, 0x80000000), emu.cpu_instance.system.msr_sysenter_eip);
+
+    // Verify UART output 'M'
+    const output = emu.getUartOutput();
+    try std.testing.expect(output != null);
+    try std.testing.expectEqualStrings("M", output.?);
+}
+
+test "integration: sysenter and sysexit" {
+    const allocator = std.testing.allocator;
+
+    // User code that calls into kernel
+    const user_code = [_]u8{
+        // Output 'U' from user mode
+        // mov edx, 0x3F8
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        // mov al, 'U'
+        0xB0, 'U',
+        // out dx, al
+        0xEE,
+
+        // Execute SYSENTER
+        0x0F, 0x34,
+
+        // This code executes after SYSEXIT returns
+        // Output 'R' for return
+        // mov edx, 0x3F8
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        // mov al, 'R'
+        0xB0, 'R',
+        // out dx, al
+        0xEE,
+
+        // hlt
+        0xF4,
+    };
+
+    // Kernel entry point code
+    const kernel_code = [_]u8{
+        // Output 'K' from kernel mode
+        // mov edx, 0x3F8
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        // mov al, 'K'
+        0xB0, 'K',
+        // out dx, al
+        0xEE,
+
+        // Set up return to user mode
+        // mov ecx, user_stack (0x00001000)
+        0xB9, 0x00, 0x10, 0x00, 0x00,
+        // mov edx, user_eip (0x0011 = after SYSENTER)
+        0xBA, 0x11, 0x00, 0x00, 0x00,
+
+        // Execute SYSEXIT
+        0x0F, 0x35,
+    };
+
+    var emu = try Emulator.init(allocator, .{
+        .memory_size = 1024 * 1024,
+        .enable_uart = true,
+    });
+    defer emu.deinit();
+
+    // Switch to protected mode for SYSENTER/SYSEXIT
+    emu.cpu_instance.mode = .protected;
+
+    // Configure SYSENTER MSRs
+    emu.cpu_instance.system.msr_sysenter_cs = 0x0008; // Kernel CS
+    emu.cpu_instance.system.msr_sysenter_esp = 0xC0000000; // Kernel stack
+    emu.cpu_instance.system.msr_sysenter_eip = 0x80000000; // Kernel entry
+
+    // Set up user mode segments
+    emu.cpu_instance.segments.cs = 0x001B; // User CS (RPL=3)
+    emu.cpu_instance.segments.ss = 0x0023; // User SS (RPL=3)
+    emu.cpu_instance.regs.esp = 0x00001000; // User stack
+
+    // Load user code at 0x0000
+    try emu.loadBinary(&user_code, 0x0000);
+
+    // Load kernel code at 0x80000000
+    try emu.loadBinary(&kernel_code, 0x80000000);
+
+    // Run with cycle limit
+    var cycles: usize = 0;
+    while (!emu.cpu_instance.isHalted() and cycles < 100) : (cycles += 1) {
+        try emu.step();
+    }
+
+    // Verify we're back in user mode
+    try std.testing.expectEqual(@as(u16, 0x001B), emu.cpu_instance.segments.cs);
+
+    // Verify UART output is "UKR" - U from user, K from kernel, R from user after return
+    const output = emu.getUartOutput();
+    try std.testing.expect(output != null);
+    try std.testing.expectEqualStrings("UKR", output.?);
+}

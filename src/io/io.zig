@@ -7,10 +7,12 @@ const std = @import("std");
 const uart_mod = @import("uart.zig");
 const pit_mod = @import("pit.zig");
 const pic_mod = @import("pic.zig");
+const kbd_mod = @import("keyboard.zig");
 
 pub const Uart = uart_mod.Uart;
 pub const Pit = pit_mod.Pit;
 pub const Pic = pic_mod.Pic;
+pub const KeyboardController = kbd_mod.KeyboardController;
 
 /// I/O access errors
 pub const IoError = error{
@@ -36,6 +38,8 @@ pub const IoController = struct {
     master_pic: ?Pic,
     /// Slave PIC (8259) at 0xA0-0xA1
     slave_pic: ?Pic,
+    /// Keyboard controller (8042) at 0x60/0x64
+    keyboard: ?KeyboardController,
     allocator: std.mem.Allocator,
 
     const Self = @This();
@@ -52,6 +56,11 @@ pub const IoController = struct {
     pub const SLAVE_PIC_CMD: u16 = 0xA0;
     pub const SLAVE_PIC_DATA: u16 = 0xA1;
 
+    /// Keyboard controller port addresses
+    pub const KEYBOARD_DATA: u16 = 0x60;
+    pub const KEYBOARD_STATUS: u16 = 0x64;
+    pub const KEYBOARD_COMMAND: u16 = 0x64;
+
     /// Initialize I/O controller
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
@@ -60,6 +69,7 @@ pub const IoController = struct {
             .pit = null,
             .master_pic = null,
             .slave_pic = null,
+            .keyboard = null,
             .allocator = allocator,
         };
     }
@@ -70,6 +80,9 @@ pub const IoController = struct {
             if (uart_opt.*) |*uart| {
                 uart.deinit();
             }
+        }
+        if (self.keyboard) |*kbd| {
+            kbd.deinit();
         }
     }
 
@@ -88,6 +101,9 @@ pub const IoController = struct {
         }
         if (self.slave_pic) |*pic| {
             pic.reset();
+        }
+        if (self.keyboard) |*kbd| {
+            kbd.reset();
         }
     }
 
@@ -154,6 +170,19 @@ pub const IoController = struct {
         return null;
     }
 
+    /// Register the keyboard controller (8042) at ports 0x60/0x64
+    pub fn registerKeyboard(self: *Self) void {
+        self.keyboard = KeyboardController.init(self.allocator);
+    }
+
+    /// Get keyboard controller
+    pub fn getKeyboard(self: *Self) ?*KeyboardController {
+        if (self.keyboard != null) {
+            return &self.keyboard.?;
+        }
+        return null;
+    }
+
     /// Find UART for a port address
     fn findUartForPort(self: *Self, port: u16) ?*Uart {
         for (0..4) |i| {
@@ -180,6 +209,19 @@ pub const IoController = struct {
 
     /// Read byte from I/O port
     pub fn readByte(self: *Self, port: u16) !u8 {
+        // Check for keyboard controller (0x60, 0x64)
+        if (port == KEYBOARD_DATA) {
+            if (self.keyboard) |*kbd| {
+                return kbd.readData();
+            }
+        }
+
+        if (port == KEYBOARD_STATUS) {
+            if (self.keyboard) |*kbd| {
+                return kbd.readStatus();
+            }
+        }
+
         // Check for master PIC (0x20-0x21)
         if (port == MASTER_PIC_CMD or port == MASTER_PIC_DATA) {
             if (self.master_pic) |*pic| {
@@ -217,6 +259,21 @@ pub const IoController = struct {
 
     /// Write byte to I/O port
     pub fn writeByte(self: *Self, port: u16, value: u8) !void {
+        // Check for keyboard controller (0x60, 0x64)
+        if (port == KEYBOARD_DATA) {
+            if (self.keyboard) |*kbd| {
+                kbd.writeData(value);
+                return;
+            }
+        }
+
+        if (port == KEYBOARD_COMMAND) {
+            if (self.keyboard) |*kbd| {
+                kbd.writeCommand(value);
+                return;
+            }
+        }
+
         // Check for master PIC (0x20-0x21)
         if (port == MASTER_PIC_CMD or port == MASTER_PIC_DATA) {
             if (self.master_pic) |*pic| {
@@ -363,5 +420,83 @@ test "io controller pic initialization" {
     try std.testing.expect(master != null);
     if (master) |pic| {
         try std.testing.expectEqual(@as(u8, 0x20), pic.vector_base);
+    }
+}
+
+test "io controller keyboard registration" {
+    const allocator = std.testing.allocator;
+    var io = IoController.init(allocator);
+    defer io.deinit();
+
+    io.registerKeyboard();
+
+    const kbd = io.getKeyboard();
+    try std.testing.expect(kbd != null);
+}
+
+test "io controller keyboard self-test" {
+    const allocator = std.testing.allocator;
+    var io = IoController.init(allocator);
+    defer io.deinit();
+
+    io.registerKeyboard();
+
+    // Send self-test command via port 0x64
+    try io.writeByte(IoController.KEYBOARD_COMMAND, 0xAA);
+
+    // Read status from port 0x64
+    const status = try io.readByte(IoController.KEYBOARD_STATUS);
+    try std.testing.expect((status & 0x01) != 0); // Output buffer full
+
+    // Read result from port 0x60 (should be 0x55)
+    const result = try io.readByte(IoController.KEYBOARD_DATA);
+    try std.testing.expectEqual(@as(u8, 0x55), result);
+}
+
+test "io controller keyboard enable/disable" {
+    const allocator = std.testing.allocator;
+    var io = IoController.init(allocator);
+    defer io.deinit();
+
+    io.registerKeyboard();
+
+    const kbd = io.getKeyboard();
+    try std.testing.expect(kbd != null);
+
+    if (kbd) |k| {
+        // Initially enabled
+        try std.testing.expect(k.isKeyboardEnabled());
+
+        // Disable via command port
+        try io.writeByte(IoController.KEYBOARD_COMMAND, 0xAD);
+        try std.testing.expect(!k.isKeyboardEnabled());
+
+        // Enable via command port
+        try io.writeByte(IoController.KEYBOARD_COMMAND, 0xAE);
+        try std.testing.expect(k.isKeyboardEnabled());
+    }
+}
+
+test "io controller keyboard scan codes" {
+    const allocator = std.testing.allocator;
+    var io = IoController.init(allocator);
+    defer io.deinit();
+
+    io.registerKeyboard();
+
+    const kbd = io.getKeyboard();
+    try std.testing.expect(kbd != null);
+
+    if (kbd) |k| {
+        // Queue scan codes
+        try k.queueScanCode(0x1E); // 'A' make
+        try k.queueScanCode(0x9E); // 'A' break
+
+        // Read via I/O ports
+        const scancode1 = try io.readByte(IoController.KEYBOARD_DATA);
+        try std.testing.expectEqual(@as(u8, 0x1E), scancode1);
+
+        const scancode2 = try io.readByte(IoController.KEYBOARD_DATA);
+        try std.testing.expectEqual(@as(u8, 0x9E), scancode2);
     }
 }
