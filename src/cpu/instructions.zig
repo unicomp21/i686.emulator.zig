@@ -271,6 +271,58 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             cpu.regs.setReg32(reg, value);
         },
 
+        // PUSHA/PUSHAD - Push all general-purpose registers
+        0x60 => {
+            if (cpu.prefix.operand_size_override) {
+                // PUSHA: Push 16-bit registers in order: AX, CX, DX, BX, SP, BP, SI, DI
+                const sp_temp = cpu.regs.esp; // Save SP before any pushes
+                try cpu.push16(@truncate(cpu.regs.eax)); // AX
+                try cpu.push16(@truncate(cpu.regs.ecx)); // CX
+                try cpu.push16(@truncate(cpu.regs.edx)); // DX
+                try cpu.push16(@truncate(cpu.regs.ebx)); // BX
+                try cpu.push16(@truncate(sp_temp)); // SP (original value)
+                try cpu.push16(@truncate(cpu.regs.ebp)); // BP
+                try cpu.push16(@truncate(cpu.regs.esi)); // SI
+                try cpu.push16(@truncate(cpu.regs.edi)); // DI
+            } else {
+                // PUSHAD: Push 32-bit registers in order: EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI
+                const esp_temp = cpu.regs.esp; // Save ESP before any pushes
+                try cpu.push(cpu.regs.eax); // EAX
+                try cpu.push(cpu.regs.ecx); // ECX
+                try cpu.push(cpu.regs.edx); // EDX
+                try cpu.push(cpu.regs.ebx); // EBX
+                try cpu.push(esp_temp); // ESP (original value)
+                try cpu.push(cpu.regs.ebp); // EBP
+                try cpu.push(cpu.regs.esi); // ESI
+                try cpu.push(cpu.regs.edi); // EDI
+            }
+        },
+
+        // POPA/POPAD - Pop all general-purpose registers
+        0x61 => {
+            if (cpu.prefix.operand_size_override) {
+                // POPA: Pop 16-bit registers in reverse order: DI, SI, BP, skip SP, BX, DX, CX, AX
+                cpu.regs.setReg16(7, try cpu.pop16()); // DI
+                cpu.regs.setReg16(6, try cpu.pop16()); // SI
+                cpu.regs.setReg16(5, try cpu.pop16()); // BP
+                _ = try cpu.pop16(); // Skip SP (discard value)
+                cpu.regs.setReg16(3, try cpu.pop16()); // BX
+                cpu.regs.setReg16(2, try cpu.pop16()); // DX
+                cpu.regs.setReg16(1, try cpu.pop16()); // CX
+                cpu.regs.setReg16(0, try cpu.pop16()); // AX
+            } else {
+                // POPAD: Pop 32-bit registers in reverse order: EDI, ESI, EBP, skip ESP, EBX, EDX, ECX, EAX
+                cpu.regs.setReg32(7, try cpu.pop()); // EDI
+                cpu.regs.setReg32(6, try cpu.pop()); // ESI
+                cpu.regs.setReg32(5, try cpu.pop()); // EBP
+                _ = try cpu.pop(); // Skip ESP (discard value)
+                cpu.regs.setReg32(3, try cpu.pop()); // EBX
+                cpu.regs.setReg32(2, try cpu.pop()); // EDX
+                cpu.regs.setReg32(1, try cpu.pop()); // ECX
+                cpu.regs.setReg32(0, try cpu.pop()); // EAX
+            }
+        },
+
         // ADD AL, imm8
         0x04 => {
             const imm = try fetchByte(cpu);
@@ -1183,6 +1235,63 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
             // No-op for emulator
         },
 
+        // CMPXCHG r/m8, r8 - Compare and exchange
+        0xB0 => {
+            const modrm = try fetchModRM(cpu);
+            const dest = try readRM8(cpu, modrm);
+            const src = cpu.regs.getReg8(modrm.reg);
+            const accumulator = @as(u8, @truncate(cpu.regs.eax)); // AL
+
+            // Compare AL with destination
+            _ = subWithFlags8(cpu, accumulator, dest);
+
+            if (accumulator == dest) {
+                // ZF=1, source -> destination
+                try writeRM8(cpu, modrm, src);
+            } else {
+                // ZF=0, destination -> AL
+                cpu.regs.setReg8(0, dest);
+            }
+        },
+
+        // CMPXCHG r/m16/32, r16/32 - Compare and exchange
+        0xB1 => {
+            const modrm = try fetchModRM(cpu);
+            if (cpu.prefix.operand_size_override) {
+                // 16-bit operand
+                const dest = try readRM16(cpu, modrm);
+                const src = cpu.regs.getReg16(modrm.reg);
+                const accumulator = @as(u16, @truncate(cpu.regs.eax)); // AX
+
+                // Compare AX with destination
+                _ = subWithFlags16(cpu, accumulator, dest);
+
+                if (accumulator == dest) {
+                    // ZF=1, source -> destination
+                    try writeRM16(cpu, modrm, src);
+                } else {
+                    // ZF=0, destination -> AX
+                    cpu.regs.setReg16(0, dest);
+                }
+            } else {
+                // 32-bit operand
+                const dest = try readRM32(cpu, modrm);
+                const src = cpu.regs.getReg32(modrm.reg);
+                const accumulator = cpu.regs.eax; // EAX
+
+                // Compare EAX with destination
+                _ = subWithFlags32(cpu, accumulator, dest);
+
+                if (accumulator == dest) {
+                    // ZF=1, source -> destination
+                    try writeRM32(cpu, modrm, src);
+                } else {
+                    // ZF=0, destination -> EAX
+                    cpu.regs.eax = dest;
+                }
+            }
+        },
+
         // LSS r16/32, m16:16/m16:32 - Load far pointer from memory into SS:r
         0xB2 => {
             const modrm = try fetchModRM(cpu);
@@ -1334,6 +1443,40 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
             cpu.flags.carry = ((value >> @truncate(bit_pos)) & 1) != 0;
         },
 
+        // SHLD r/m16/32, r16/32, imm8 - Shift left double
+        0xA4 => {
+            const modrm = try fetchModRM(cpu);
+            const count = try fetchByte(cpu);
+            if (cpu.prefix.operand_size_override) {
+                const dest = try readRM16(cpu, modrm);
+                const src = cpu.regs.getReg16(modrm.reg);
+                const result = shld16(cpu, dest, src, count);
+                try writeRM16(cpu, modrm, result);
+            } else {
+                const dest = try readRM32(cpu, modrm);
+                const src = cpu.regs.getReg32(modrm.reg);
+                const result = shld32(cpu, dest, src, count);
+                try writeRM32(cpu, modrm, result);
+            }
+        },
+
+        // SHLD r/m16/32, r16/32, CL - Shift left double
+        0xA5 => {
+            const modrm = try fetchModRM(cpu);
+            const count = @as(u8, @truncate(cpu.regs.ecx));
+            if (cpu.prefix.operand_size_override) {
+                const dest = try readRM16(cpu, modrm);
+                const src = cpu.regs.getReg16(modrm.reg);
+                const result = shld16(cpu, dest, src, count);
+                try writeRM16(cpu, modrm, result);
+            } else {
+                const dest = try readRM32(cpu, modrm);
+                const src = cpu.regs.getReg32(modrm.reg);
+                const result = shld32(cpu, dest, src, count);
+                try writeRM32(cpu, modrm, result);
+            }
+        },
+
         // BTS r/m32, r32 - Bit test and set
         0xAB => {
             const modrm = try fetchModRM(cpu);
@@ -1342,6 +1485,40 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
             cpu.flags.carry = ((value >> @truncate(bit_pos)) & 1) != 0;
             const new_value = value | (@as(u32, 1) << @truncate(bit_pos));
             try writeRM32(cpu, modrm, new_value);
+        },
+
+        // SHRD r/m16/32, r16/32, imm8 - Shift right double
+        0xAC => {
+            const modrm = try fetchModRM(cpu);
+            const count = try fetchByte(cpu);
+            if (cpu.prefix.operand_size_override) {
+                const dest = try readRM16(cpu, modrm);
+                const src = cpu.regs.getReg16(modrm.reg);
+                const result = shrd16(cpu, dest, src, count);
+                try writeRM16(cpu, modrm, result);
+            } else {
+                const dest = try readRM32(cpu, modrm);
+                const src = cpu.regs.getReg32(modrm.reg);
+                const result = shrd32(cpu, dest, src, count);
+                try writeRM32(cpu, modrm, result);
+            }
+        },
+
+        // SHRD r/m16/32, r16/32, CL - Shift right double
+        0xAD => {
+            const modrm = try fetchModRM(cpu);
+            const count = @as(u8, @truncate(cpu.regs.ecx));
+            if (cpu.prefix.operand_size_override) {
+                const dest = try readRM16(cpu, modrm);
+                const src = cpu.regs.getReg16(modrm.reg);
+                const result = shrd16(cpu, dest, src, count);
+                try writeRM16(cpu, modrm, result);
+            } else {
+                const dest = try readRM32(cpu, modrm);
+                const src = cpu.regs.getReg32(modrm.reg);
+                const result = shrd32(cpu, dest, src, count);
+                try writeRM32(cpu, modrm, result);
+            }
         },
 
         // BTR r/m32, r32 - Bit test and reset
@@ -1402,6 +1579,89 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
                 }
                 cpu.regs.setReg32(modrm.reg, bit_index);
             }
+        },
+
+        // XADD r/m8, r8 - Exchange and add
+        0xC0 => {
+            const modrm = try fetchModRM(cpu);
+            const dest = try readRM8(cpu, modrm);
+            const src = cpu.regs.getReg8(modrm.reg);
+
+            // TEMP = dest + src
+            const sum = addWithFlags8(cpu, dest, src);
+
+            // src = original dest, dest = TEMP
+            cpu.regs.setReg8(modrm.reg, dest);
+            try writeRM8(cpu, modrm, sum);
+        },
+
+        // XADD r/m16/32, r16/32 - Exchange and add
+        0xC1 => {
+            const modrm = try fetchModRM(cpu);
+            if (cpu.prefix.operand_size_override) {
+                // 16-bit operand
+                const dest = try readRM16(cpu, modrm);
+                const src = cpu.regs.getReg16(modrm.reg);
+
+                // TEMP = dest + src
+                const sum = addWithFlags16(cpu, dest, src);
+
+                // src = original dest, dest = TEMP
+                cpu.regs.setReg16(modrm.reg, dest);
+                try writeRM16(cpu, modrm, sum);
+            } else {
+                // 32-bit operand
+                const dest = try readRM32(cpu, modrm);
+                const src = cpu.regs.getReg32(modrm.reg);
+
+                // TEMP = dest + src
+                const sum = addWithFlags32(cpu, dest, src);
+
+                // src = original dest, dest = TEMP
+                cpu.regs.setReg32(modrm.reg, dest);
+                try writeRM32(cpu, modrm, sum);
+            }
+        },
+
+        // CMPXCHG8B m64 - Compare and exchange 8 bytes
+        0xC7 => {
+            const modrm = try fetchModRM(cpu);
+            // CMPXCHG8B only supports /1 encoding (modrm.reg == 1)
+            if (modrm.reg != 1) {
+                return CpuError.InvalidOpcode;
+            }
+            // Must be a memory operand
+            if (modrm.mod == 3) {
+                return CpuError.InvalidOpcode;
+            }
+
+            const addr = try calculateEffectiveAddress(cpu, modrm);
+
+            // Read 8 bytes from memory (EDX:EAX)
+            const mem_low = try cpu.readMemDword(addr);
+            const mem_high = try cpu.readMemDword(addr + 4);
+
+            // Compare EDX:EAX with m64
+            if (cpu.regs.edx == mem_high and cpu.regs.eax == mem_low) {
+                // ZF=1, ECX:EBX -> m64
+                cpu.flags.zero = true;
+                try cpu.writeMemDword(addr, cpu.regs.ebx);
+                try cpu.writeMemDword(addr + 4, cpu.regs.ecx);
+            } else {
+                // ZF=0, m64 -> EDX:EAX
+                cpu.flags.zero = false;
+                cpu.regs.eax = mem_low;
+                cpu.regs.edx = mem_high;
+            }
+        },
+
+        // BSWAP r32 (0F C8+rd) - Byte swap register
+        0xC8...0xCF => {
+            const reg: u3 = @truncate(opcode & 0x7);
+            const value = cpu.regs.getReg32(reg);
+            // Swap byte order: 0x12345678 -> 0x78563412
+            const swapped = @byteSwap(value);
+            cpu.regs.setReg32(reg, swapped);
         },
 
         else => {
@@ -1777,6 +2037,150 @@ fn shiftRotate32(cpu: *Cpu, op: u3, value: u32, count: u5) u32 {
                 else => false,
             };
         }
+    }
+
+    return result;
+}
+
+/// SHLD - Shift left double (32-bit)
+fn shld32(cpu: *Cpu, dest: u32, src: u32, count_in: u8) u32 {
+    // Count is masked to 5 bits (0-31)
+    const count = count_in & 0x1F;
+    if (count == 0) return dest;
+
+    var result: u32 = undefined;
+    var cf: bool = undefined;
+
+    if (count <= 32) {
+        // Shift destination left by count, fill from source's high bits
+        result = (dest << @truncate(count)) | (src >> @truncate(32 - count));
+        // CF = last bit shifted out from dest
+        cf = ((dest >> @truncate(32 - count)) & 1) != 0;
+    } else {
+        // Undefined behavior for count > 32, but we handle it anyway
+        result = dest;
+        cf = false;
+    }
+
+    cpu.flags.carry = cf;
+    cpu.flags.zero = result == 0;
+    cpu.flags.sign = (result & 0x80000000) != 0;
+    cpu.flags.parity = @popCount(@as(u8, @truncate(result))) % 2 == 0;
+
+    // OF is defined only for 1-bit shifts
+    if (count == 1) {
+        cpu.flags.overflow = (result & 0x80000000) != (dest & 0x80000000);
+    }
+    // OF is undefined for count > 1
+
+    return result;
+}
+
+/// SHLD - Shift left double (16-bit)
+fn shld16(cpu: *Cpu, dest: u16, src: u16, count_in: u8) u16 {
+    // Count is masked to 5 bits, but only 0-15 are meaningful for 16-bit
+    const count = count_in & 0x1F;
+    if (count == 0) return dest;
+
+    var result: u16 = undefined;
+    var cf: bool = undefined;
+
+    if (count <= 16) {
+        // Shift destination left by count, fill from source's high bits
+        result = (dest << @truncate(count)) | (src >> @truncate(16 - count));
+        // CF = last bit shifted out from dest
+        cf = ((dest >> @truncate(16 - count)) & 1) != 0;
+    } else {
+        // For count > 16, behavior continues with wrapping
+        const effective_count = count & 0x0F; // Wrap around for 16-bit
+        if (effective_count == 0) {
+            result = dest;
+            cf = (dest & 1) != 0;
+        } else {
+            result = (dest << @truncate(effective_count)) | (src >> @truncate(16 - effective_count));
+            cf = ((dest >> @truncate(16 - effective_count)) & 1) != 0;
+        }
+    }
+
+    cpu.flags.carry = cf;
+    cpu.flags.zero = result == 0;
+    cpu.flags.sign = (result & 0x8000) != 0;
+    cpu.flags.parity = @popCount(@as(u8, @truncate(result))) % 2 == 0;
+
+    if (count == 1) {
+        cpu.flags.overflow = (result & 0x8000) != (dest & 0x8000);
+    }
+
+    return result;
+}
+
+/// SHRD - Shift right double (32-bit)
+fn shrd32(cpu: *Cpu, dest: u32, src: u32, count_in: u8) u32 {
+    // Count is masked to 5 bits (0-31)
+    const count = count_in & 0x1F;
+    if (count == 0) return dest;
+
+    var result: u32 = undefined;
+    var cf: bool = undefined;
+
+    if (count <= 32) {
+        // Shift destination right by count, fill from source's low bits
+        result = (dest >> @truncate(count)) | (src << @truncate(32 - count));
+        // CF = last bit shifted out from dest
+        cf = ((dest >> @truncate(count - 1)) & 1) != 0;
+    } else {
+        // Undefined behavior for count > 32
+        result = dest;
+        cf = false;
+    }
+
+    cpu.flags.carry = cf;
+    cpu.flags.zero = result == 0;
+    cpu.flags.sign = (result & 0x80000000) != 0;
+    cpu.flags.parity = @popCount(@as(u8, @truncate(result))) % 2 == 0;
+
+    // OF is defined only for 1-bit shifts
+    if (count == 1) {
+        // OF = MSB changed
+        cpu.flags.overflow = (result & 0x80000000) != (dest & 0x80000000);
+    }
+
+    return result;
+}
+
+/// SHRD - Shift right double (16-bit)
+fn shrd16(cpu: *Cpu, dest: u16, src: u16, count_in: u8) u16 {
+    // Count is masked to 5 bits
+    const count = count_in & 0x1F;
+    if (count == 0) return dest;
+
+    var result: u16 = undefined;
+    var cf: bool = undefined;
+
+    if (count <= 16) {
+        // Shift destination right by count, fill from source's low bits
+        result = (dest >> @truncate(count)) | (src << @truncate(16 - count));
+        // CF = last bit shifted out from dest
+        cf = ((dest >> @truncate(count - 1)) & 1) != 0;
+    } else {
+        // For count > 16, behavior continues
+        const effective_count = count & 0x0F;
+        if (effective_count == 0) {
+            result = dest;
+            cf = (dest & 0x8000) != 0;
+        } else {
+            result = (dest >> @truncate(effective_count)) | (src << @truncate(16 - effective_count));
+            cf = ((dest >> @truncate(effective_count - 1)) & 1) != 0;
+        }
+    }
+
+    cpu.flags.carry = cf;
+    cpu.flags.zero = result == 0;
+    cpu.flags.sign = (result & 0x8000) != 0;
+    cpu.flags.parity = @popCount(@as(u8, @truncate(result))) % 2 == 0;
+
+    if (count == 1) {
+        cpu.flags.overflow = (result & 0x8000) != (dest & 0x8000);
     }
 
     return result;
@@ -3497,4 +3901,686 @@ test "str and ltr instructions" {
 
     // Verify TR was stored to DX
     try std.testing.expectEqual(@as(u16, 0x0040), cpu.regs.getReg16(2)); // DX
+}
+
+test "cmpxchg instruction - equal (exchange happens)" {
+    const allocator = std.testing.allocator;
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // CMPXCHG EBX, ECX (0x0F 0xB1 0xCB)
+    // If EAX == EBX, then EBX = ECX
+    try mem.writeByte(0, 0x0F);
+    try mem.writeByte(1, 0xB1);
+    try mem.writeByte(2, 0xCB); // ModR/M: mod=11, reg=001 (ECX), rm=011 (EBX)
+
+    cpu.regs.eax = 0x12345678; // Accumulator
+    cpu.regs.ebx = 0x12345678; // Destination (equal to EAX)
+    cpu.regs.ecx = 0xABCDEF00; // Source
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // Since EAX == EBX, EBX should be updated with ECX value
+    try std.testing.expectEqual(@as(u32, 0xABCDEF00), cpu.regs.ebx);
+    // EAX should remain unchanged
+    try std.testing.expectEqual(@as(u32, 0x12345678), cpu.regs.eax);
+    // ZF should be set
+    try std.testing.expect(cpu.flags.zero);
+}
+
+test "cmpxchg instruction - not equal (accumulator updated)" {
+    const allocator = std.testing.allocator;
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // CMPXCHG EBX, ECX (0x0F 0xB1 0xCB)
+    // If EAX != EBX, then EAX = EBX
+    try mem.writeByte(0, 0x0F);
+    try mem.writeByte(1, 0xB1);
+    try mem.writeByte(2, 0xCB); // ModR/M: mod=11, reg=001 (ECX), rm=011 (EBX)
+
+    cpu.regs.eax = 0x12345678; // Accumulator
+    cpu.regs.ebx = 0x87654321; // Destination (not equal to EAX)
+    cpu.regs.ecx = 0xABCDEF00; // Source
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // Since EAX != EBX, EAX should be updated with EBX value
+    try std.testing.expectEqual(@as(u32, 0x87654321), cpu.regs.eax);
+    // EBX should remain unchanged
+    try std.testing.expectEqual(@as(u32, 0x87654321), cpu.regs.ebx);
+    // ZF should be clear
+    try std.testing.expect(!cpu.flags.zero);
+}
+
+test "cmpxchg8 instruction" {
+    const allocator = std.testing.allocator;
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // CMPXCHG BL, CL (0x0F 0xB0 0xCB)
+    // If AL == BL, then BL = CL
+    try mem.writeByte(0, 0x0F);
+    try mem.writeByte(1, 0xB0);
+    try mem.writeByte(2, 0xCB); // ModR/M: mod=11, reg=001 (CL), rm=011 (BL)
+
+    cpu.regs.eax = 0x00000042; // AL = 0x42
+    cpu.regs.ebx = 0x00000042; // BL = 0x42 (equal to AL)
+    cpu.regs.ecx = 0x000000AA; // CL = 0xAA
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // Since AL == BL, BL should be updated with CL value
+    try std.testing.expectEqual(@as(u8, 0xAA), cpu.regs.getReg8(3)); // BL
+    // AL should remain unchanged
+    try std.testing.expectEqual(@as(u8, 0x42), cpu.regs.getReg8(0)); // AL
+    // ZF should be set
+    try std.testing.expect(cpu.flags.zero);
+}
+
+test "xadd instruction - register exchange and add" {
+    const allocator = std.testing.allocator;
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // XADD EBX, ECX (0x0F 0xC1 0xCB)
+    // TEMP = EBX + ECX, ECX = EBX, EBX = TEMP
+    try mem.writeByte(0, 0x0F);
+    try mem.writeByte(1, 0xC1);
+    try mem.writeByte(2, 0xCB); // ModR/M: mod=11, reg=001 (ECX), rm=011 (EBX)
+
+    cpu.regs.ebx = 0x00000010; // Destination
+    cpu.regs.ecx = 0x00000005; // Source
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // EBX should contain sum (0x10 + 0x05 = 0x15)
+    try std.testing.expectEqual(@as(u32, 0x00000015), cpu.regs.ebx);
+    // ECX should contain original EBX value (0x10)
+    try std.testing.expectEqual(@as(u32, 0x00000010), cpu.regs.ecx);
+    // Flags should be updated based on the addition
+    try std.testing.expect(!cpu.flags.zero);
+    try std.testing.expect(!cpu.flags.carry);
+}
+
+test "xadd8 instruction - byte exchange and add" {
+    const allocator = std.testing.allocator;
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // XADD BL, CL (0x0F 0xC0 0xCB)
+    // TEMP = BL + CL, CL = BL, BL = TEMP
+    try mem.writeByte(0, 0x0F);
+    try mem.writeByte(1, 0xC0);
+    try mem.writeByte(2, 0xCB); // ModR/M: mod=11, reg=001 (CL), rm=011 (BL)
+
+    cpu.regs.ebx = 0x00000020; // BL = 0x20
+    cpu.regs.ecx = 0x00000015; // CL = 0x15
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // BL should contain sum (0x20 + 0x15 = 0x35)
+    try std.testing.expectEqual(@as(u8, 0x35), cpu.regs.getReg8(3)); // BL
+    // CL should contain original BL value (0x20)
+    try std.testing.expectEqual(@as(u8, 0x20), cpu.regs.getReg8(1)); // CL
+}
+
+test "cmpxchg8b instruction - equal (exchange happens)" {
+    const allocator = std.testing.allocator;
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // CMPXCHG8B [0x100] (0x0F 0xC7 0x0D 0x00 0x01 0x00 0x00)
+    // ModR/M: mod=00, reg=001 (CMPXCHG8B), rm=101 (disp32)
+    try mem.writeByte(0, 0x0F);
+    try mem.writeByte(1, 0xC7);
+    try mem.writeByte(2, 0x0D); // ModR/M: mod=00, reg=001, rm=101
+    try mem.writeByte(3, 0x00); // disp32 low byte
+    try mem.writeByte(4, 0x01); // disp32
+    try mem.writeByte(5, 0x00); // disp32
+    try mem.writeByte(6, 0x00); // disp32 high byte
+
+    // Setup memory at 0x100 with 64-bit value 0x87654321_12345678
+    try mem.writeDword(0x100, 0x12345678); // Low dword
+    try mem.writeDword(0x104, 0x87654321); // High dword
+
+    // Setup registers: EDX:EAX = 0x87654321_12345678 (equal to memory)
+    cpu.regs.eax = 0x12345678; // Low dword
+    cpu.regs.edx = 0x87654321; // High dword
+    // ECX:EBX = 0xAABBCCDD_11223344 (value to write)
+    cpu.regs.ebx = 0x11223344; // Low dword
+    cpu.regs.ecx = 0xAABBCCDD; // High dword
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // Since EDX:EAX == memory, memory should be updated with ECX:EBX
+    try std.testing.expectEqual(@as(u32, 0x11223344), try mem.readDword(0x100));
+    try std.testing.expectEqual(@as(u32, 0xAABBCCDD), try mem.readDword(0x104));
+    // EDX:EAX should remain unchanged
+    try std.testing.expectEqual(@as(u32, 0x12345678), cpu.regs.eax);
+    try std.testing.expectEqual(@as(u32, 0x87654321), cpu.regs.edx);
+    // ZF should be set
+    try std.testing.expect(cpu.flags.zero);
+}
+
+test "cmpxchg8b instruction - not equal (accumulator updated)" {
+    const allocator = std.testing.allocator;
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // CMPXCHG8B [0x100] (0x0F 0xC7 0x0D 0x00 0x01 0x00 0x00)
+    try mem.writeByte(0, 0x0F);
+    try mem.writeByte(1, 0xC7);
+    try mem.writeByte(2, 0x0D); // ModR/M: mod=00, reg=001, rm=101
+    try mem.writeByte(3, 0x00); // disp32 low byte
+    try mem.writeByte(4, 0x01); // disp32
+    try mem.writeByte(5, 0x00); // disp32
+    try mem.writeByte(6, 0x00); // disp32 high byte
+
+    // Setup memory at 0x100 with 64-bit value 0xFFEEDDCC_AABBCCDD
+    try mem.writeDword(0x100, 0xAABBCCDD); // Low dword
+    try mem.writeDword(0x104, 0xFFEEDDCC); // High dword
+
+    // Setup registers: EDX:EAX = 0x87654321_12345678 (NOT equal to memory)
+    cpu.regs.eax = 0x12345678; // Low dword
+    cpu.regs.edx = 0x87654321; // High dword
+    // ECX:EBX = 0x11111111_22222222 (value to write - won't be used)
+    cpu.regs.ebx = 0x22222222; // Low dword
+    cpu.regs.ecx = 0x11111111; // High dword
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // Since EDX:EAX != memory, EDX:EAX should be updated with memory value
+    try std.testing.expectEqual(@as(u32, 0xAABBCCDD), cpu.regs.eax);
+    try std.testing.expectEqual(@as(u32, 0xFFEEDDCC), cpu.regs.edx);
+    // Memory should remain unchanged
+    try std.testing.expectEqual(@as(u32, 0xAABBCCDD), try mem.readDword(0x100));
+    try std.testing.expectEqual(@as(u32, 0xFFEEDDCC), try mem.readDword(0x104));
+    // ZF should be clear
+    try std.testing.expect(!cpu.flags.zero);
+}
+
+test "pushad and popad round-trip" {
+    const allocator = std.testing.allocator;
+
+    var mem = try mem_mod.Memory.init(allocator, 1024 * 1024);
+    defer mem.deinit();
+
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set initial register values
+    cpu.regs.eax = 0x11111111;
+    cpu.regs.ecx = 0x22222222;
+    cpu.regs.edx = 0x33333333;
+    cpu.regs.ebx = 0x44444444;
+    cpu.regs.esp = 0x1000;
+    cpu.regs.ebp = 0x55555555;
+    cpu.regs.esi = 0x66666666;
+    cpu.regs.edi = 0x77777777;
+
+    const original_esp = cpu.regs.esp;
+
+    // PUSHAD (0x60)
+    try mem.writeByte(0, 0x60);
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // Verify ESP decreased by 32 bytes (8 registers * 4 bytes)
+    try std.testing.expectEqual(original_esp - 32, cpu.regs.esp);
+
+    // Modify registers to verify POPAD restores them
+    cpu.regs.eax = 0xAAAAAAAA;
+    cpu.regs.ecx = 0xBBBBBBBB;
+    cpu.regs.edx = 0xCCCCCCCC;
+    cpu.regs.ebx = 0xDDDDDDDD;
+    cpu.regs.ebp = 0xEEEEEEEE;
+    cpu.regs.esi = 0xFFFFFFFF;
+    cpu.regs.edi = 0x12345678;
+
+    // POPAD (0x61)
+    try mem.writeByte(1, 0x61);
+
+    cpu.eip = 1;
+    try cpu.step();
+
+    // Verify all registers restored (except ESP which should be back to original)
+    try std.testing.expectEqual(@as(u32, 0x11111111), cpu.regs.eax);
+    try std.testing.expectEqual(@as(u32, 0x22222222), cpu.regs.ecx);
+    try std.testing.expectEqual(@as(u32, 0x33333333), cpu.regs.edx);
+    try std.testing.expectEqual(@as(u32, 0x44444444), cpu.regs.ebx);
+    try std.testing.expectEqual(@as(u32, 0x55555555), cpu.regs.ebp);
+    try std.testing.expectEqual(@as(u32, 0x66666666), cpu.regs.esi);
+    try std.testing.expectEqual(@as(u32, 0x77777777), cpu.regs.edi);
+
+    // ESP should be back to original value
+    try std.testing.expectEqual(original_esp, cpu.regs.esp);
+}
+
+test "pusha with 16-bit operand size" {
+    const allocator = std.testing.allocator;
+
+    var mem = try mem_mod.Memory.init(allocator, 1024 * 1024);
+    defer mem.deinit();
+
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set initial register values (only low 16 bits matter for PUSHA)
+    cpu.regs.eax = 0xDEAD1111;
+    cpu.regs.ecx = 0xBEEF2222;
+    cpu.regs.edx = 0xCAFE3333;
+    cpu.regs.ebx = 0xFACE4444;
+    cpu.regs.esp = 0x1000;
+    cpu.regs.ebp = 0xABCD5555;
+    cpu.regs.esi = 0x12346666;
+    cpu.regs.edi = 0x56787777;
+
+    const original_esp = cpu.regs.esp;
+
+    // 0x66 0x60 (operand size override + PUSHA)
+    try mem.writeByte(0, 0x66); // Operand size override prefix
+    try mem.writeByte(1, 0x60); // PUSHA
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // Verify ESP decreased by 16 bytes (8 registers * 2 bytes)
+    try std.testing.expectEqual(original_esp - 16, cpu.regs.esp);
+
+    // POPA (0x66 0x61)
+    try mem.writeByte(2, 0x66); // Operand size override prefix
+    try mem.writeByte(3, 0x61); // POPA
+
+    cpu.eip = 2;
+    try cpu.step();
+
+    // Verify low 16 bits of all registers restored
+    try std.testing.expectEqual(@as(u16, 0x1111), cpu.regs.getReg16(0)); // AX
+    try std.testing.expectEqual(@as(u16, 0x2222), cpu.regs.getReg16(1)); // CX
+    try std.testing.expectEqual(@as(u16, 0x3333), cpu.regs.getReg16(2)); // DX
+    try std.testing.expectEqual(@as(u16, 0x4444), cpu.regs.getReg16(3)); // BX
+    try std.testing.expectEqual(@as(u16, 0x5555), cpu.regs.getReg16(5)); // BP
+    try std.testing.expectEqual(@as(u16, 0x6666), cpu.regs.getReg16(6)); // SI
+    try std.testing.expectEqual(@as(u16, 0x7777), cpu.regs.getReg16(7)); // DI
+
+    // ESP should be back to original value
+    try std.testing.expectEqual(original_esp, cpu.regs.esp);
+}
+
+test "popad does not modify esp from stack" {
+    const allocator = std.testing.allocator;
+
+    var mem = try mem_mod.Memory.init(allocator, 1024 * 1024);
+    defer mem.deinit();
+
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    cpu.regs.esp = 0x1000;
+
+    // PUSHAD
+    try mem.writeByte(0, 0x60);
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    const after_pushad_esp = cpu.regs.esp;
+
+    // Manually modify the ESP value on the stack (4th dword pushed)
+    // Stack layout after PUSHAD: [EDI, ESI, EBP, ESP, EBX, EDX, ECX, EAX]
+    // ESP is at offset +12 from current ESP
+    try mem.writeDword(after_pushad_esp + 12, 0x99999999);
+
+    // POPAD
+    try mem.writeByte(1, 0x61);
+
+    cpu.eip = 1;
+    try cpu.step();
+
+    // ESP should be restored to original value (0x1000), not the modified value (0x99999999)
+    // This is because POPAD skips the ESP value from the stack
+    try std.testing.expectEqual(@as(u32, 0x1000), cpu.regs.esp);
+}
+
+test "bswap instruction" {
+    const allocator = std.testing.allocator;
+
+    var mem = try mem_mod.Memory.init(allocator, 1024 * 1024);
+    defer mem.deinit();
+
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test BSWAP EAX (0F C8)
+    cpu.regs.eax = 0x12345678;
+    try mem.writeByte(0, 0x0F);
+    try mem.writeByte(1, 0xC8);
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u32, 0x78563412), cpu.regs.eax);
+
+    // Test BSWAP ECX (0F C9)
+    cpu.regs.ecx = 0xAABBCCDD;
+    try mem.writeByte(2, 0x0F);
+    try mem.writeByte(3, 0xC9);
+
+    cpu.eip = 2;
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u32, 0xDDCCBBAA), cpu.regs.ecx);
+
+    // Test BSWAP EDX (0F CA)
+    cpu.regs.edx = 0x11223344;
+    try mem.writeByte(4, 0x0F);
+    try mem.writeByte(5, 0xCA);
+
+    cpu.eip = 4;
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u32, 0x44332211), cpu.regs.edx);
+
+    // Test BSWAP EBX (0F CB)
+    cpu.regs.ebx = 0xFFEEDDCC;
+    try mem.writeByte(6, 0x0F);
+    try mem.writeByte(7, 0xCB);
+
+    cpu.eip = 6;
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u32, 0xCCDDEEFF), cpu.regs.ebx);
+
+    // Test BSWAP ESP (0F CC)
+    cpu.regs.esp = 0x01020304;
+    try mem.writeByte(8, 0x0F);
+    try mem.writeByte(9, 0xCC);
+
+    cpu.eip = 8;
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u32, 0x04030201), cpu.regs.esp);
+
+    // Test BSWAP EBP (0F CD)
+    cpu.regs.ebp = 0xDEADBEEF;
+    try mem.writeByte(10, 0x0F);
+    try mem.writeByte(11, 0xCD);
+
+    cpu.eip = 10;
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u32, 0xEFBEADDE), cpu.regs.ebp);
+
+    // Test BSWAP ESI (0F CE)
+    cpu.regs.esi = 0xCAFEBABE;
+    try mem.writeByte(12, 0x0F);
+    try mem.writeByte(13, 0xCE);
+
+    cpu.eip = 12;
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u32, 0xBEBAFECA), cpu.regs.esi);
+
+    // Test BSWAP EDI (0F CF)
+    cpu.regs.edi = 0x13579BDF;
+    try mem.writeByte(14, 0x0F);
+    try mem.writeByte(15, 0xCF);
+
+    cpu.eip = 14;
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u32, 0xDF9B5713), cpu.regs.edi);
+}
+
+test "shld instruction: immediate count" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test SHLD EAX, EBX, 4
+    // EAX = 0x12345678, EBX = 0xABCDEF00
+    // Result: shift EAX left by 4, fill from high bits of EBX
+    // EAX should become 0x23456780 | 0x0000000A = 0x2345678A
+    cpu.regs.eax = 0x12345678;
+    cpu.regs.ebx = 0xABCDEF00;
+
+    // 0F A4 C3 04: SHLD EBX, EAX, 4
+    // ModR/M: 0xC3 = mod=11 (register), reg=000 (EAX), rm=011 (EBX)
+    try mem.writeByte(0, 0x0F);
+    try mem.writeByte(1, 0xA4);
+    try mem.writeByte(2, 0xC3); // ModR/M: dest=EBX, src=EAX
+    try mem.writeByte(3, 0x04); // count=4
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // EBX = 0xABCDEF00 << 4 | 0x12345678 >> 28
+    // EBX = 0xBCDEF000 | 0x00000001 = 0xBCDEF001
+    try std.testing.expectEqual(@as(u32, 0xBCDEF001), cpu.regs.ebx);
+
+    // CF should be set to the last bit shifted out from EBX
+    // Bit 27 (32-4-1) of EBX should be checked
+    // 0xABCDEF00 bit 27 = (0xABCDEF00 >> 27) & 1 = 0x55 >> 3 & 1 = 1
+    try std.testing.expect(cpu.flags.carry);
+}
+
+test "shld instruction: CL count" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test SHLD EDX, ESI, CL with CL=8
+    cpu.regs.edx = 0x11223344;
+    cpu.regs.esi = 0x55667788;
+    cpu.regs.ecx = 8; // CL = 8
+
+    // 0F A5 F2: SHLD EDX, ESI, CL
+    // ModR/M: 0xF2 = mod=11, reg=110 (ESI), rm=010 (EDX)
+    try mem.writeByte(0, 0x0F);
+    try mem.writeByte(1, 0xA5);
+    try mem.writeByte(2, 0xF2);
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // EDX = 0x11223344 << 8 | 0x55667788 >> 24
+    // EDX = 0x22334400 | 0x00000055 = 0x22334455
+    try std.testing.expectEqual(@as(u32, 0x22334455), cpu.regs.edx);
+    try std.testing.expect(cpu.flags.carry);
+}
+
+test "shld instruction: 16-bit operand" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test SHLD AX, BX, 4 with operand size override
+    cpu.regs.eax = 0x00001234;
+    cpu.regs.ebx = 0x0000ABCD;
+
+    // 66 0F A4 C3 04: SHLD BX, AX, 4 (with 0x66 prefix)
+    try mem.writeByte(0, 0x66); // Operand size override
+    try mem.writeByte(1, 0x0F);
+    try mem.writeByte(2, 0xA4);
+    try mem.writeByte(3, 0xC3); // ModR/M: dest=BX, src=AX
+    try mem.writeByte(4, 0x04); // count=4
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // BX = 0xABCD << 4 | 0x1234 >> 12
+    // BX = 0xBCD0 | 0x0001 = 0xBCD1
+    const result = cpu.regs.getReg16(3); // BX
+    try std.testing.expectEqual(@as(u16, 0xBCD1), result);
+}
+
+test "shrd instruction: immediate count" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test SHRD EAX, EBX, 4
+    cpu.regs.eax = 0x12345678;
+    cpu.regs.ebx = 0xABCDEF00;
+
+    // 0F AC C3 04: SHRD EBX, EAX, 4
+    // ModR/M: 0xC3 = mod=11, reg=000 (EAX), rm=011 (EBX)
+    try mem.writeByte(0, 0x0F);
+    try mem.writeByte(1, 0xAC);
+    try mem.writeByte(2, 0xC3);
+    try mem.writeByte(3, 0x04); // count=4
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // EBX = 0xABCDEF00 >> 4 | 0x12345678 << 28
+    // EBX = 0x0ABCDEF0 | 0x80000000 = 0x8ABCDEF0
+    try std.testing.expectEqual(@as(u32, 0x8ABCDEF0), cpu.regs.ebx);
+
+    // CF should be the last bit shifted out (bit 3 of original EBX)
+    // We need to check if this is set correctly
+}
+
+test "shrd instruction: CL count" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test SHRD EDI, ECX, CL with CL=12
+    cpu.regs.edi = 0xFEDCBA98;
+    cpu.regs.ecx = 0x13579BDF; // Also sets CL=0xDF, but we'll mask it
+    cpu.regs.ecx = 12; // Set CL=12
+
+    // 0F AD CF: SHRD EDI, ECX, CL
+    // ModR/M: 0xCF = mod=11, reg=001 (ECX), rm=111 (EDI)
+    try mem.writeByte(0, 0x0F);
+    try mem.writeByte(1, 0xAD);
+    try mem.writeByte(2, 0xCF);
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // EDI = 0xFEDCBA98 >> 12 | 0x0000000C << 20
+    // EDI = 0x000FEDCB | 0x0C000000 = 0x0CFEDCB (wait, ECX=12, not 0x0C)
+    // EDI = 0xFEDCBA98 >> 12 | 12 << 20
+    // EDI = 0x000FEDCB | 0x00C00000 = 0x00CFEDCB
+    try std.testing.expectEqual(@as(u32, 0x00CFEDCB), cpu.regs.edi);
+}
+
+test "shrd instruction: verify carry flag" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test SHRD with count=1 to verify CF
+    cpu.regs.eax = 0xFFFFFFFF;
+    cpu.regs.ebx = 0x00000000;
+
+    // SHRD EAX, EBX, 1
+    try mem.writeByte(0, 0x0F);
+    try mem.writeByte(1, 0xAC);
+    try mem.writeByte(2, 0xC0); // ModR/M: dest=EAX, src=EAX
+    try mem.writeByte(3, 0x01);
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // EAX bit 0 should be shifted into CF
+    try std.testing.expect(cpu.flags.carry);
+    // Result should be 0x7FFFFFFF (shifted right by 1, high bit from EBX=0)
+    try std.testing.expectEqual(@as(u32, 0x7FFFFFFF), cpu.regs.eax);
 }

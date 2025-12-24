@@ -223,7 +223,7 @@ Implemented instruction groups:
 - **Segment Loading**: LES, LDS, LSS, LFS, LGS (load far pointers with segment:offset)
 - **Arithmetic**: ADD, SUB, INC, DEC, CMP, MUL, IMUL, DIV, IDIV, NEG, CBW/CWDE, CWD/CDQ
 - **Logic**: XOR, AND, OR, NOT, TEST
-- **Shift/Rotate**: SHL, SHR, SAR, ROL, ROR, RCL, RCR
+- **Shift/Rotate**: SHL, SHR, SAR, ROL, ROR, RCL, RCR, SHLD, SHRD
 - **Bit Manipulation**: BT, BTS, BTR, BTC, BSF, BSR, SETcc
 - **String Operations**: MOVS, STOS, LODS, CMPS, SCAS (with REP/REPNE prefixes)
 - **Control Flow**: JMP, Jcc, CALL, RET, INT, LEAVE
