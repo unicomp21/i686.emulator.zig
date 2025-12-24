@@ -68,6 +68,45 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             }
         },
 
+        // CALL ptr16:16/ptr16:32 - Far call (direct)
+        0x9A => {
+            if (cpu.prefix.operand_size_override) {
+                // 16-bit: CALL ptr16:16 (offset16, selector16)
+                const offset = try fetchWord(cpu);
+                const selector = try fetchWord(cpu);
+
+                // Push current CS and IP
+                try cpu.push16(cpu.segments.cs);
+                try cpu.push16(@truncate(cpu.eip));
+
+                // Load new CS and IP
+                cpu.segments.cs = selector;
+                cpu.eip = offset;
+
+                // In protected mode, load segment descriptor into cache
+                if (cpu.mode == .protected) {
+                    try cpu.loadSegmentDescriptor(cpu.segments.cs, 1); // CS is index 1
+                }
+            } else {
+                // 32-bit: CALL ptr16:32 (offset32, selector16)
+                const offset = try fetchDword(cpu);
+                const selector = try fetchWord(cpu);
+
+                // Push current CS and EIP
+                try cpu.push16(cpu.segments.cs);
+                try cpu.push(cpu.eip);
+
+                // Load new CS and EIP
+                cpu.segments.cs = selector;
+                cpu.eip = offset;
+
+                // In protected mode, load segment descriptor into cache
+                if (cpu.mode == .protected) {
+                    try cpu.loadSegmentDescriptor(cpu.segments.cs, 1); // CS is index 1
+                }
+            }
+        },
+
         // PUSHF/PUSHFD - Push flags
         0x9C => {
             if (cpu.prefix.operand_size_override) {
@@ -175,6 +214,13 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             }
         },
 
+        // MOV r/m16, Sreg - Store segment register to r/m16
+        0x8C => {
+            const modrm = try fetchModRM(cpu);
+            const seg_value = cpu.segments.getSegment(modrm.reg);
+            try writeRM16(cpu, modrm, seg_value);
+        },
+
         // LEA r16/32, m
         0x8D => {
             const modrm = try fetchModRM(cpu);
@@ -183,6 +229,22 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
                 cpu.regs.setReg16(modrm.reg, @truncate(addr));
             } else {
                 cpu.regs.setReg32(modrm.reg, addr);
+            }
+        },
+
+        // MOV Sreg, r/m16 - Load segment register from r/m16
+        0x8E => {
+            const modrm = try fetchModRM(cpu);
+            // Cannot load CS with this instruction
+            if (modrm.reg == 1) {
+                return CpuError.GeneralProtectionFault;
+            }
+            const value = try readRM16(cpu, modrm);
+            cpu.segments.setSegment(modrm.reg, value);
+
+            // In protected mode, load segment descriptor into cache
+            if (cpu.mode == .protected) {
+                try cpu.loadSegmentDescriptor(value, modrm.reg);
             }
         },
 
@@ -320,6 +382,72 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
                 cpu.regs.setReg32(2, try cpu.pop()); // EDX
                 cpu.regs.setReg32(1, try cpu.pop()); // ECX
                 cpu.regs.setReg32(0, try cpu.pop()); // EAX
+            }
+        },
+
+        // IMUL r16/32, r/m16/32, imm16/32 - Three-operand signed multiply
+        0x69 => {
+            const modrm = try fetchModRM(cpu);
+            if (cpu.prefix.operand_size_override) {
+                // 16-bit: IMUL r16, r/m16, imm16
+                const rm_value: i16 = @bitCast(try readRM16(cpu, modrm));
+                const imm_value: i16 = @bitCast(try fetchWord(cpu));
+                const result: i32 = @as(i32, rm_value) * @as(i32, imm_value);
+                const truncated: i16 = @truncate(result);
+
+                // Set CF and OF if result doesn't fit in 16 bits (sign extension differs)
+                const overflow = result != @as(i32, truncated);
+                cpu.flags.carry = overflow;
+                cpu.flags.overflow = overflow;
+
+                cpu.regs.setReg16(modrm.reg, @bitCast(truncated));
+            } else {
+                // 32-bit: IMUL r32, r/m32, imm32
+                const rm_value: i32 = @bitCast(try readRM32(cpu, modrm));
+                const imm_value: i32 = @bitCast(try fetchDword(cpu));
+                const result: i64 = @as(i64, rm_value) * @as(i64, imm_value);
+                const truncated: i32 = @truncate(result);
+
+                // Set CF and OF if result doesn't fit in 32 bits (sign extension differs)
+                const overflow = result != @as(i64, truncated);
+                cpu.flags.carry = overflow;
+                cpu.flags.overflow = overflow;
+
+                cpu.regs.setReg32(modrm.reg, @bitCast(truncated));
+            }
+        },
+
+        // IMUL r16/32, r/m16/32, imm8 - Three-operand signed multiply with sign-extended imm8
+        0x6B => {
+            const modrm = try fetchModRM(cpu);
+            const imm8: i8 = @bitCast(try fetchByte(cpu));
+
+            if (cpu.prefix.operand_size_override) {
+                // 16-bit: IMUL r16, r/m16, imm8 (sign-extended to 16 bits)
+                const rm_value: i16 = @bitCast(try readRM16(cpu, modrm));
+                const imm_value: i16 = imm8; // Sign extension from i8 to i16
+                const result: i32 = @as(i32, rm_value) * @as(i32, imm_value);
+                const truncated: i16 = @truncate(result);
+
+                // Set CF and OF if result doesn't fit in 16 bits (sign extension differs)
+                const overflow = result != @as(i32, truncated);
+                cpu.flags.carry = overflow;
+                cpu.flags.overflow = overflow;
+
+                cpu.regs.setReg16(modrm.reg, @bitCast(truncated));
+            } else {
+                // 32-bit: IMUL r32, r/m32, imm8 (sign-extended to 32 bits)
+                const rm_value: i32 = @bitCast(try readRM32(cpu, modrm));
+                const imm_value: i32 = imm8; // Sign extension from i8 to i32
+                const result: i64 = @as(i64, rm_value) * @as(i64, imm_value);
+                const truncated: i32 = @truncate(result);
+
+                // Set CF and OF if result doesn't fit in 32 bits (sign extension differs)
+                const overflow = result != @as(i64, truncated);
+                cpu.flags.carry = overflow;
+                cpu.flags.overflow = overflow;
+
+                cpu.regs.setReg32(modrm.reg, @bitCast(truncated));
             }
         },
 
@@ -620,6 +748,37 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             }
         },
 
+        // JMP ptr16:16/ptr16:32 - Far jump (direct)
+        0xEA => {
+            if (cpu.prefix.operand_size_override) {
+                // 16-bit: JMP ptr16:16 (offset16, selector16)
+                const offset = try fetchWord(cpu);
+                const selector = try fetchWord(cpu);
+
+                // Load new CS and IP
+                cpu.segments.cs = selector;
+                cpu.eip = offset;
+
+                // In protected mode, load segment descriptor into cache
+                if (cpu.mode == .protected) {
+                    try cpu.loadSegmentDescriptor(cpu.segments.cs, 1); // CS is index 1
+                }
+            } else {
+                // 32-bit: JMP ptr16:32 (offset32, selector16)
+                const offset = try fetchDword(cpu);
+                const selector = try fetchWord(cpu);
+
+                // Load new CS and EIP
+                cpu.segments.cs = selector;
+                cpu.eip = offset;
+
+                // In protected mode, load segment descriptor into cache
+                if (cpu.mode == .protected) {
+                    try cpu.loadSegmentDescriptor(cpu.segments.cs, 1); // CS is index 1
+                }
+            }
+        },
+
         // Jcc rel8 (short conditional jumps)
         0x70 => try jccRel8(cpu, cpu.flags.overflow), // JO
         0x71 => try jccRel8(cpu, !cpu.flags.overflow), // JNO
@@ -714,6 +873,68 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             const imm = try fetchWord(cpu);
             cpu.eip = try cpu.pop();
             cpu.regs.esp +%= imm;
+        },
+
+        // RETF - Far return
+        0xCB => {
+            if (cpu.prefix.operand_size_override) {
+                // 16-bit: Pop IP and CS
+                const new_ip = try cpu.pop16();
+                const new_cs = try cpu.pop16();
+
+                cpu.eip = new_ip;
+                cpu.segments.cs = new_cs;
+
+                // In protected mode, load segment descriptor into cache
+                if (cpu.mode == .protected) {
+                    try cpu.loadSegmentDescriptor(cpu.segments.cs, 1); // CS is index 1
+                }
+            } else {
+                // 32-bit: Pop EIP and CS
+                const new_eip = try cpu.pop();
+                const new_cs = try cpu.pop16();
+
+                cpu.eip = new_eip;
+                cpu.segments.cs = new_cs;
+
+                // In protected mode, load segment descriptor into cache
+                if (cpu.mode == .protected) {
+                    try cpu.loadSegmentDescriptor(cpu.segments.cs, 1); // CS is index 1
+                }
+            }
+        },
+
+        // RETF imm16 - Far return with stack cleanup
+        0xCA => {
+            const imm = try fetchWord(cpu);
+
+            if (cpu.prefix.operand_size_override) {
+                // 16-bit: Pop IP and CS, then adjust stack
+                const new_ip = try cpu.pop16();
+                const new_cs = try cpu.pop16();
+
+                cpu.eip = new_ip;
+                cpu.segments.cs = new_cs;
+                cpu.regs.esp +%= imm;
+
+                // In protected mode, load segment descriptor into cache
+                if (cpu.mode == .protected) {
+                    try cpu.loadSegmentDescriptor(cpu.segments.cs, 1); // CS is index 1
+                }
+            } else {
+                // 32-bit: Pop EIP and CS, then adjust stack
+                const new_eip = try cpu.pop();
+                const new_cs = try cpu.pop16();
+
+                cpu.eip = new_eip;
+                cpu.segments.cs = new_cs;
+                cpu.regs.esp +%= imm;
+
+                // In protected mode, load segment descriptor into cache
+                if (cpu.mode == .protected) {
+                    try cpu.loadSegmentDescriptor(cpu.segments.cs, 1); // CS is index 1
+                }
+            }
         },
 
         // ENTER - High-level procedure entry (create stack frame)
@@ -861,6 +1082,20 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
                     const offset: i8 = @bitCast(rel);
                     cpu.eip = @bitCast(@as(i32, @bitCast(cpu.eip)) +% offset);
                 }
+            }
+        },
+
+        // JECXZ/JCXZ - Jump if ECX/CX is zero
+        0xE3 => {
+            const rel = try fetchByte(cpu);
+            const should_jump = if (cpu.prefix.address_size_override)
+                cpu.regs.getReg16(1) == 0 // JCXZ: test CX
+            else
+                cpu.regs.ecx == 0; // JECXZ: test ECX
+
+            if (should_jump) {
+                const offset: i8 = @bitCast(rel);
+                cpu.eip = @bitCast(@as(i32, @bitCast(cpu.eip)) +% offset);
             }
         },
 
@@ -1188,6 +1423,11 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
         // Group 7 (LGDT, LIDT, etc.)
         0x01 => {
             try executeGroup7(cpu);
+        },
+
+        // CLTS - Clear Task-Switched flag in CR0
+        0x06 => {
+            cpu.system.cr0.ts = false;
         },
 
         // MOV r32, CRn
@@ -4583,4 +4823,502 @@ test "shrd instruction: verify carry flag" {
     try std.testing.expect(cpu.flags.carry);
     // Result should be 0x7FFFFFFF (shifted right by 1, high bit from EBX=0)
     try std.testing.expectEqual(@as(u32, 0x7FFFFFFF), cpu.regs.eax);
+}
+
+test "mov segment to register: MOV AX, DS" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set DS to a test value
+    cpu.segments.ds = 0x1234;
+
+    // MOV AX, DS (0x8C /r with reg=3 for DS, r/m=0 for AX)
+    // ModR/M: mod=11 (register), reg=011 (DS), rm=000 (AX)
+    try mem.writeByte(0, 0x8C);
+    try mem.writeByte(1, 0xD8); // 11 011 000
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u16, 0x1234), cpu.regs.getReg16(0)); // AX
+}
+
+test "mov register to segment: MOV DS, AX" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set AX to a test value
+    cpu.regs.setReg16(0, 0x5678);
+
+    // MOV DS, AX (0x8E /r with reg=3 for DS, r/m=0 for AX)
+    // ModR/M: mod=11 (register), reg=011 (DS), rm=000 (AX)
+    try mem.writeByte(0, 0x8E);
+    try mem.writeByte(1, 0xD8); // 11 011 000
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u16, 0x5678), cpu.segments.ds);
+}
+
+test "mov segment to memory: MOV [0x1000], ES" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set ES to a test value
+    cpu.segments.es = 0xABCD;
+
+    // MOV [0x1000], ES (0x8C /r with reg=0 for ES, memory addressing)
+    // ModR/M: mod=00 (indirect), reg=000 (ES), rm=101 (disp32)
+    try mem.writeByte(0, 0x8C);
+    try mem.writeByte(1, 0x05); // 00 000 101
+    try mem.writeDword(2, 0x1000); // displacement
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    const value = try mem.readWord(0x1000);
+    try std.testing.expectEqual(@as(u16, 0xABCD), value);
+}
+
+test "mov memory to segment: MOV SS, [0x2000]" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Write test value to memory
+    try mem.writeWord(0x2000, 0x9876);
+
+    // MOV SS, [0x2000] (0x8E /r with reg=2 for SS, memory addressing)
+    // ModR/M: mod=00 (indirect), reg=010 (SS), rm=101 (disp32)
+    try mem.writeByte(0, 0x8E);
+    try mem.writeByte(1, 0x15); // 00 010 101
+    try mem.writeDword(2, 0x2000); // displacement
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u16, 0x9876), cpu.segments.ss);
+}
+
+test "mov cs to register fails: cannot load CS with MOV" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set AX to a test value
+    cpu.regs.setReg16(0, 0x1234);
+
+    // Try MOV CS, AX (0x8E /r with reg=1 for CS, r/m=0 for AX)
+    // ModR/M: mod=11 (register), reg=001 (CS), rm=000 (AX)
+    try mem.writeByte(0, 0x8E);
+    try mem.writeByte(1, 0xC8); // 11 001 000
+
+    cpu.eip = 0;
+    const result = cpu.step();
+
+    try std.testing.expectError(CpuError.GeneralProtectionFault, result);
+}
+
+test "far jmp: JMP ptr16:32 in real mode" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set initial CS:EIP
+    cpu.segments.cs = 0x0000;
+    cpu.eip = 0;
+
+    // JMP 0x2000:0x00001234 (far jump in 32-bit mode)
+    // Opcode: 0xEA, offset32, selector16
+    try mem.writeByte(0, 0xEA); // JMP far
+    try mem.writeDword(1, 0x00001234); // offset32
+    try mem.writeWord(5, 0x2000); // selector16
+
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u16, 0x2000), cpu.segments.cs);
+    try std.testing.expectEqual(@as(u32, 0x00001234), cpu.eip);
+}
+
+test "far jmp: JMP ptr16:16 in 16-bit mode" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set initial CS:EIP
+    cpu.segments.cs = 0x0000;
+    cpu.eip = 0;
+
+    // JMP 0x3000:0x5678 (far jump in 16-bit mode)
+    // Opcode: 0x66 (operand size override), 0xEA, offset16, selector16
+    try mem.writeByte(0, 0x66); // operand size override
+    try mem.writeByte(1, 0xEA); // JMP far
+    try mem.writeWord(2, 0x5678); // offset16
+    try mem.writeWord(4, 0x3000); // selector16
+
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u16, 0x3000), cpu.segments.cs);
+    try std.testing.expectEqual(@as(u32, 0x5678), cpu.eip);
+}
+
+test "far call and retf: round trip in real mode" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set initial CS:EIP
+    cpu.segments.cs = 0x1000;
+    cpu.eip = 0x100;
+    cpu.regs.esp = 0x8000; // Set up stack
+
+    // CALL 0x2000:0x00000200 (far call in 32-bit mode)
+    // Opcode: 0x9A, offset32, selector16
+    try mem.writeByte(0x10100, 0x9A); // CALL far (at CS:EIP = 0x1000:0x100 -> linear 0x10100)
+    try mem.writeDword(0x10101, 0x00000200); // offset32
+    try mem.writeWord(0x10105, 0x2000); // selector16
+
+    // Execute far call
+    try cpu.step();
+
+    // Verify we jumped to new location
+    try std.testing.expectEqual(@as(u16, 0x2000), cpu.segments.cs);
+    try std.testing.expectEqual(@as(u32, 0x00000200), cpu.eip);
+
+    // Verify return address was pushed (CS, then EIP)
+    // Stack grows down: first push CS (2 bytes), then push EIP (4 bytes)
+    const saved_cs = try mem.readWord(0x8000 - 6); // First push
+    const saved_eip = try mem.readDword(0x8000 - 4); // Second push
+    try std.testing.expectEqual(@as(u16, 0x1000), saved_cs);
+    try std.testing.expectEqual(@as(u32, 0x10107), saved_eip); // Return address after 7-byte instruction
+
+    // Put RETF instruction at target location
+    try mem.writeByte(0x20200, 0xCB); // RETF (at CS:EIP = 0x2000:0x200 -> linear 0x20200)
+
+    // Execute far return
+    try cpu.step();
+
+    // Verify we returned to original location
+    try std.testing.expectEqual(@as(u16, 0x1000), cpu.segments.cs);
+    try std.testing.expectEqual(@as(u32, 0x10107), cpu.eip);
+    try std.testing.expectEqual(@as(u32, 0x8000), cpu.regs.esp); // Stack pointer restored
+}
+
+test "retf with stack cleanup: RETF imm16" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set up stack with return address
+    cpu.regs.esp = 0x8000;
+
+    // Push CS and EIP onto stack manually
+    cpu.regs.esp -= 6;
+    try mem.writeWord(cpu.regs.esp, 0x1234); // Return CS
+    try mem.writeDword(cpu.regs.esp + 2, 0x56789ABC); // Return EIP
+
+    // RETF 0x10 - far return and clean up 16 bytes
+    try mem.writeByte(0, 0xCA); // RETF imm16
+    try mem.writeWord(1, 0x10); // Clean up 16 bytes
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // Verify we returned to saved location
+    try std.testing.expectEqual(@as(u16, 0x1234), cpu.segments.cs);
+    try std.testing.expectEqual(@as(u32, 0x56789ABC), cpu.eip);
+
+    // Verify stack was cleaned up (6 bytes popped + 16 bytes added)
+    try std.testing.expectEqual(@as(u32, 0x8000 + 0x10), cpu.regs.esp);
+}
+
+test "jecxz: jump when ecx is zero" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set ECX to 0
+    cpu.regs.ecx = 0;
+    cpu.eip = 0;
+
+    // JECXZ +10 (jump forward 10 bytes)
+    try mem.writeByte(0, 0xE3); // JECXZ
+    try mem.writeByte(1, 0x0A); // rel8 = +10
+
+    try cpu.step();
+
+    // Jump should be taken: EIP = 2 (after instruction) + 10 = 12
+    try std.testing.expectEqual(@as(u32, 12), cpu.eip);
+}
+
+test "jecxz: no jump when ecx is non-zero" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set ECX to non-zero
+    cpu.regs.ecx = 5;
+    cpu.eip = 0;
+
+    // JECXZ +10
+    try mem.writeByte(0, 0xE3); // JECXZ
+    try mem.writeByte(1, 0x0A); // rel8 = +10
+
+    try cpu.step();
+
+    // Jump should NOT be taken: EIP = 2 (after instruction)
+    try std.testing.expectEqual(@as(u32, 2), cpu.eip);
+}
+
+test "jcxz: jump when cx is zero (with address size override)" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set ECX so that CX (low word) is 0, but high word is not
+    cpu.regs.ecx = 0x12340000; // CX = 0, but ECX != 0
+    cpu.eip = 0;
+
+    // JCXZ +10 (with address size override)
+    try mem.writeByte(0, 0x67); // Address size override prefix
+    try mem.writeByte(1, 0xE3); // JCXZ
+    try mem.writeByte(2, 0x0A); // rel8 = +10
+
+    try cpu.step();
+
+    // Jump should be taken because CX == 0: EIP = 3 (after instruction) + 10 = 13
+    try std.testing.expectEqual(@as(u32, 13), cpu.eip);
+}
+
+test "imul r32, r32, imm8: basic multiplication" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set EBX = 10
+    cpu.regs.ebx = 10;
+    cpu.eip = 0;
+
+    // IMUL EAX, EBX, 5 (EAX = EBX * 5 = 50)
+    // Opcode: 0x6B, ModR/M: 11 000 011 (mod=11, reg=EAX, rm=EBX), imm8=5
+    try mem.writeByte(0, 0x6B); // IMUL r32, r/m32, imm8
+    try mem.writeByte(1, 0xC3); // ModR/M: EAX, EBX
+    try mem.writeByte(2, 0x05); // imm8 = 5
+
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u32, 50), cpu.regs.eax);
+    // No overflow, so CF and OF should be clear
+    try std.testing.expectEqual(false, cpu.flags.carry);
+    try std.testing.expectEqual(false, cpu.flags.overflow);
+}
+
+test "imul r32, r32, imm8: with overflow" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set EBX to a large value that will overflow when multiplied
+    cpu.regs.ebx = 0x10000000; // 268435456
+    cpu.eip = 0;
+
+    // IMUL EAX, EBX, 16 (will overflow 32-bit signed)
+    try mem.writeByte(0, 0x6B); // IMUL r32, r/m32, imm8
+    try mem.writeByte(1, 0xC3); // ModR/M: EAX, EBX
+    try mem.writeByte(2, 0x10); // imm8 = 16
+
+    try cpu.step();
+
+    // Result will be truncated, but CF and OF should be set
+    try std.testing.expectEqual(true, cpu.flags.carry);
+    try std.testing.expectEqual(true, cpu.flags.overflow);
+}
+
+test "imul r32, r32, imm32: basic multiplication" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set ECX = 100
+    cpu.regs.ecx = 100;
+    cpu.eip = 0;
+
+    // IMUL EDX, ECX, 1000 (EDX = ECX * 1000 = 100000)
+    // Opcode: 0x69, ModR/M: 11 010 001 (mod=11, reg=EDX, rm=ECX), imm32=1000
+    try mem.writeByte(0, 0x69); // IMUL r32, r/m32, imm32
+    try mem.writeByte(1, 0xD1); // ModR/M: EDX, ECX
+    try mem.writeDword(2, 1000); // imm32 = 1000
+
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u32, 100000), cpu.regs.edx);
+    // No overflow, so CF and OF should be clear
+    try std.testing.expectEqual(false, cpu.flags.carry);
+    try std.testing.expectEqual(false, cpu.flags.overflow);
+}
+
+test "imul r16, r16, imm16: 16-bit multiplication" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set BX = 20
+    cpu.regs.ebx = 20;
+    cpu.eip = 0;
+
+    // IMUL AX, BX, 300 (AX = BX * 300 = 6000)
+    // With operand size override prefix (0x66)
+    try mem.writeByte(0, 0x66); // Operand size override
+    try mem.writeByte(1, 0x69); // IMUL r16, r/m16, imm16
+    try mem.writeByte(2, 0xC3); // ModR/M: AX, BX
+    try mem.writeWord(3, 300); // imm16 = 300
+
+    try cpu.step();
+
+    try std.testing.expectEqual(@as(u16, 6000), @as(u16, @truncate(cpu.regs.eax)));
+    // No overflow for 16-bit signed value 6000
+    try std.testing.expectEqual(false, cpu.flags.carry);
+    try std.testing.expectEqual(false, cpu.flags.overflow);
+}
+
+test "clts: clear task-switched flag" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set CR0.TS to true
+    cpu.system.cr0.ts = true;
+    cpu.eip = 0;
+
+    // CLTS (0x0F 0x06)
+    try mem.writeByte(0, 0x0F); // Two-byte opcode prefix
+    try mem.writeByte(1, 0x06); // CLTS
+
+    try cpu.step();
+
+    // CR0.TS should now be false
+    try std.testing.expectEqual(false, cpu.system.cr0.ts);
 }

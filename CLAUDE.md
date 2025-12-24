@@ -109,7 +109,7 @@ All tests currently pass (100+):
 | I/O (via root) | 6 | ✓ Pass |
 | Keyboard | 10 | ✓ Pass |
 | Protected Mode | 8 | ✓ Pass |
-| Instructions | 13 | ✓ Pass |
+| Instructions | 20 | ✓ Pass |
 | Integration | 22 | ✓ Pass |
 
 ### Test Categories
@@ -221,15 +221,15 @@ Core CPU emulation:
 Implemented instruction groups:
 - **Data Movement**: MOV, LEA, PUSH, POP, MOVZX, MOVSX, XCHG, LAHF, SAHF
 - **Segment Loading**: LES, LDS, LSS, LFS, LGS (load far pointers with segment:offset)
-- **Arithmetic**: ADD, SUB, INC, DEC, CMP, MUL, IMUL, DIV, IDIV, NEG, CBW/CWDE, CWD/CDQ
+- **Arithmetic**: ADD, SUB, INC, DEC, CMP, MUL, IMUL (1/2/3-operand forms), DIV, IDIV, NEG, CBW/CWDE, CWD/CDQ
 - **Logic**: XOR, AND, OR, NOT, TEST
 - **Shift/Rotate**: SHL, SHR, SAR, ROL, ROR, RCL, RCR, SHLD, SHRD
 - **Bit Manipulation**: BT, BTS, BTR, BTC, BSF, BSR, SETcc
 - **String Operations**: MOVS, STOS, LODS, CMPS, SCAS (with REP/REPNE prefixes)
-- **Control Flow**: JMP, Jcc, CALL, RET, INT, LEAVE
+- **Control Flow**: JMP, Jcc, JECXZ/JCXZ, LOOP/LOOPE/LOOPNE, CALL, RET, INT, LEAVE, FAR JMP, FAR CALL, RETF
 - **Stack/Flags**: PUSHF, POPF, PUSHA, POPA
 - **I/O**: IN, OUT
-- **System**: NOP, HLT, CLI, STI, CLD, STD, SLDT, STR, LLDT, LTR, VERR, VERW
+- **System**: NOP, HLT, CLI, STI, CLD, STD, CLTS, SLDT, STR, LLDT, LTR, VERR, VERW
 - **Special**: CPUID, RDTSC
 
 ### Memory (`src/memory/memory.zig`)
