@@ -21,24 +21,30 @@ i686.emulator.zig/
 ├── build.zig              # Build configuration (native + WASM)
 ├── CLAUDE.md              # This file - AI assistant guide
 ├── README.md              # User documentation
-└── src/
-    ├── main.zig           # CLI entry point
-    ├── root.zig           # Library root and Emulator struct
-    ├── wasm.zig           # WebAssembly interface
-    ├── cpu/
-    │   ├── cpu.zig        # CPU emulation core
-    │   ├── registers.zig  # Register definitions (GPR, segments, flags)
-    │   └── instructions.zig # Instruction decoder and executor
-    ├── memory/
-    │   └── memory.zig     # Memory subsystem
-    ├── io/
-    │   ├── io.zig         # I/O controller
-    │   └── uart.zig       # UART 16550A emulation
-    ├── async/
-    │   ├── queue.zig      # Async event queue
-    │   └── eventloop.zig  # epoll-based event loop
-    └── debug/
-        └── debugger.zig   # Debug interface
+├── Dockerfile.cicd        # Docker image for CI/CD testing
+├── src/
+│   ├── main.zig           # CLI entry point
+│   ├── root.zig           # Library root and Emulator struct
+│   ├── wasm.zig           # WebAssembly interface
+│   ├── cpu/
+│   │   ├── cpu.zig        # CPU emulation core
+│   │   ├── registers.zig  # Register definitions (GPR, segments, flags)
+│   │   └── instructions.zig # Instruction decoder and executor
+│   ├── memory/
+│   │   └── memory.zig     # Memory subsystem
+│   ├── io/
+│   │   ├── io.zig         # I/O controller
+│   │   └── uart.zig       # UART 16550A emulation
+│   ├── async/
+│   │   ├── queue.zig      # Async event queue
+│   │   └── eventloop.zig  # epoll-based event loop
+│   └── debug/
+│       └── debugger.zig   # Debug interface
+└── tests/
+    ├── integration_test.zig  # Integration tests with machine code
+    └── linux/
+        ├── Makefile          # Linux kernel build infrastructure
+        └── README.md         # kselftest roadmap and status
 ```
 
 ## Build Commands
@@ -53,8 +59,11 @@ zig build run
 # Build with arguments
 zig build run -- program.bin
 
-# Run all tests
+# Run all tests (unit + integration)
 zig build test
+
+# Run only integration tests
+zig build test-integ
 
 # Build WebAssembly library
 zig build wasm
@@ -86,7 +95,7 @@ docker run --rm i686-emu-test
 
 ### Test Status
 
-All tests currently pass (24/24):
+All tests currently pass (57/57):
 
 | Test Suite | Tests | Status |
 |------------|-------|--------|
@@ -98,6 +107,7 @@ All tests currently pass (24/24):
 | Event Queue | 4 | ✓ Pass |
 | CPU (via root) | 4 | ✓ Pass |
 | I/O (via root) | 2 | ✓ Pass |
+| Integration | 6 | ✓ Pass |
 
 ### Test Categories
 
@@ -112,6 +122,7 @@ All tests currently pass (24/24):
 | Event Queue | `src/async/queue.zig` | Event prioritization, handlers |
 | Event Loop | `src/async/eventloop.zig` | Timers, interrupts, epoll |
 | Debug | `src/debug/debugger.zig` | Breakpoints, tracing |
+| Integration | `tests/integration_test.zig` | End-to-end with real machine code |
 
 ### UART Testing Pattern
 
@@ -130,6 +141,43 @@ try emu.run();
 const output = emu.getUartOutput();
 try std.testing.expectEqualStrings("expected output", output.?);
 ```
+
+### Integration Tests
+
+Integration tests (`tests/integration_test.zig`) execute real x86 machine code and verify results via UART output:
+
+```zig
+test "integration: uart hello" {
+    const program = [_]u8{
+        0xBA, 0xF8, 0x03, 0x00, 0x00, // mov edx, 0x3F8
+        0xB0, 'O',                     // mov al, 'O'
+        0xEE,                          // out dx, al
+        0xB0, 'K',                     // mov al, 'K'
+        0xEE,                          // out dx, al
+        0xF4,                          // hlt
+    };
+
+    var emu = try Emulator.init(allocator, .{ .enable_uart = true });
+    defer emu.deinit();
+    try emu.loadBinary(&program, 0);
+    try emu.run();
+
+    try std.testing.expectEqualStrings("OK", emu.getUartOutput().?);
+}
+```
+
+Run integration tests with:
+```bash
+zig build test-integ
+```
+
+Current integration tests:
+- **uart hello**: Basic UART output
+- **arithmetic**: ADD instruction and result verification
+- **loop**: Looping with DEC + JNZ
+- **call and return**: CALL/RET stack operations
+- **register preservation**: PUSH/POP register save/restore
+- **xor zero**: XOR r,r to zero register
 
 ## Key Modules
 

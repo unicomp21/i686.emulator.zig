@@ -115,6 +115,25 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_queue_tests.step);
 
     // ============================================
+    // Integration Tests
+    // ============================================
+
+    const integration_tests = b.addTest(.{
+        .root_source_file = b.path("tests/integration_test.zig"),
+        .target = native_target,
+        .optimize = optimize,
+    });
+    // Add emulator module dependency
+    integration_tests.root_module.addImport("emulator", &lib.root_module);
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+
+    const integ_step = b.step("test-integ", "Run integration tests");
+    integ_step.dependOn(&run_integration_tests.step);
+
+    // Add integration tests to main test step
+    test_step.dependOn(&run_integration_tests.step);
+
+    // ============================================
     // Documentation
     // ============================================
 

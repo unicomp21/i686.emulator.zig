@@ -56,6 +56,8 @@ pub const Emulator = struct {
     io_ctrl: IoController,
     config: Config,
     allocator: std.mem.Allocator,
+    /// Track if CPU pointers have been fixed after struct move
+    pointers_fixed: bool,
 
     const Self = @This();
 
@@ -71,6 +73,7 @@ pub const Emulator = struct {
             try io_ctrl.registerUart(config.uart_base);
         }
 
+        // Create CPU with temporary pointers (will be fixed after struct is in final location)
         var cpu_instance = Cpu.init(&mem, &io_ctrl);
         cpu_instance.reset(config.initial_cs, @truncate(config.initial_ip));
 
@@ -80,7 +83,18 @@ pub const Emulator = struct {
             .io_ctrl = io_ctrl,
             .config = config,
             .allocator = allocator,
+            .pointers_fixed = false,
         };
+    }
+
+    /// Fix CPU pointers to point to this struct's fields
+    /// Must be called after struct is in its final memory location
+    fn fixPointers(self: *Self) void {
+        if (!self.pointers_fixed) {
+            self.cpu_instance.mem = &self.mem;
+            self.cpu_instance.io_ctrl = &self.io_ctrl;
+            self.pointers_fixed = true;
+        }
     }
 
     /// Clean up emulator resources
@@ -91,18 +105,21 @@ pub const Emulator = struct {
 
     /// Execute a single instruction
     pub fn step(self: *Self) !void {
+        self.fixPointers();
         try self.cpu_instance.step();
     }
 
     /// Run until halt or breakpoint
     pub fn run(self: *Self) !void {
+        self.fixPointers();
         while (!self.cpu_instance.isHalted()) {
-            try self.step();
+            try self.cpu_instance.step();
         }
     }
 
     /// Load binary code into memory at specified address
     pub fn loadBinary(self: *Self, data: []const u8, address: u32) !void {
+        self.fixPointers();
         try self.mem.writeBytes(address, data);
     }
 
