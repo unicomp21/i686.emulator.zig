@@ -95,7 +95,7 @@ docker run --rm i686-emu-test
 
 ### Test Status
 
-All tests currently pass (80/80):
+All tests currently pass (100+):
 
 | Test Suite | Tests | Status |
 |------------|-------|--------|
@@ -106,9 +106,11 @@ All tests currently pass (80/80):
 | UART | 5 | ✓ Pass |
 | Event Queue | 4 | ✓ Pass |
 | CPU (via root) | 4 | ✓ Pass |
-| I/O (via root) | 2 | ✓ Pass |
+| I/O (via root) | 6 | ✓ Pass |
+| Keyboard | 10 | ✓ Pass |
 | Protected Mode | 8 | ✓ Pass |
-| Integration | 18 | ✓ Pass |
+| Instructions | 8 | ✓ Pass |
+| Integration | 22 | ✓ Pass |
 
 ### Test Categories
 
@@ -119,8 +121,9 @@ All tests currently pass (80/80):
 | Instructions | `src/cpu/instructions.zig` | Individual instruction execution |
 | Protected Mode | `src/cpu/protected_mode.zig` | GDT/IDT, CR0-CR4, segment descriptors, paging |
 | Memory | `src/memory/memory.zig` | Read/write, bounds checking |
-| I/O | `src/io/io.zig` | Port mapping, UART registration |
+| I/O | `src/io/io.zig` | Port mapping, UART/Keyboard registration |
 | UART | `src/io/uart.zig` | Serial I/O, register access |
+| Keyboard | `src/io/keyboard.zig` | 8042 controller, A20 gate, scan codes |
 | Event Queue | `src/async/queue.zig` | Event prioritization, handlers |
 | Event Loop | `src/async/eventloop.zig` | Timers, interrupts, epoll |
 | Debug | `src/debug/debugger.zig` | Breakpoints, tracing |
@@ -476,12 +479,16 @@ The long-term goal is running Linux kernel self-tests. Current progress:
 | Basic instructions | ✓ Done | MOV, LEA, PUSH/POP, ADD/SUB, JMP, CALL/RET, OR, AND, XOR |
 | Extended instructions | ✓ Done | MOVZX/MOVSX, shifts/rotates, TEST, MUL/DIV, bit ops |
 | String operations | ✓ Done | REP MOVS/STOS/LODS/CMPS/SCAS with prefixes |
+| Stack frames | ✓ Done | ENTER/LEAVE with nesting levels |
 | UART I/O | ✓ Done | 16550A for test output |
+| Keyboard I/O | ✓ Done | 8042 controller, A20 gate, scan codes |
+| PIC/PIT | ✓ Done | 8259 interrupt controller, 8254 timer |
 | Event system | ✓ Done | Async queue + epoll event loop |
 | Protected mode | ✓ Done | GDT/IDT, CR0-CR4, mode switching |
 | Paging | ✓ Done | 4KB pages, identity mapping, CR3/PG support |
-| System calls | ☐ TODO | INT 0x80 / SYSENTER |
-| Full instruction set | ☐ TODO | ~200 more opcodes |
+| System calls | ✓ Done | INT 0x80 with IRET, SYSENTER/SYSEXIT |
+| MSR support | ✓ Done | RDMSR/WRMSR for SYSENTER registers |
+| Full instruction set | ☐ TODO | ~150 more opcodes |
 
 ### Protected Mode Support
 
