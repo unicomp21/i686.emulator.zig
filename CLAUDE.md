@@ -95,7 +95,7 @@ docker run --rm i686-emu-test
 
 ### Test Status
 
-All tests currently pass (77/77):
+All tests currently pass (80/80):
 
 | Test Suite | Tests | Status |
 |------------|-------|--------|
@@ -108,7 +108,7 @@ All tests currently pass (77/77):
 | CPU (via root) | 4 | ✓ Pass |
 | I/O (via root) | 2 | ✓ Pass |
 | Protected Mode | 8 | ✓ Pass |
-| Integration | 15 | ✓ Pass |
+| Integration | 18 | ✓ Pass |
 
 ### Test Categories
 
@@ -189,6 +189,9 @@ Current integration tests:
 - **shifts**: SHL, SHR, SAR with immediate count
 - **test instruction**: TEST with flag verification
 - **mul div**: MUL and DIV arithmetic operations
+- **rep movsb**: REP MOVSB string copy operation
+- **pushf popf**: Flag save/restore operations
+- **bsf bsr**: Bit scan forward/reverse operations
 
 ## Key Modules
 
@@ -213,11 +216,14 @@ Core CPU emulation:
 ### Instructions (`src/cpu/instructions.zig`)
 
 Implemented instruction groups:
-- **Data Movement**: MOV, LEA, PUSH, POP, MOVZX, MOVSX
-- **Arithmetic**: ADD, SUB, INC, DEC, CMP, MUL, IMUL, DIV, IDIV, NEG
+- **Data Movement**: MOV, LEA, PUSH, POP, MOVZX, MOVSX, XCHG, LAHF, SAHF
+- **Arithmetic**: ADD, SUB, INC, DEC, CMP, MUL, IMUL, DIV, IDIV, NEG, CBW/CWDE, CWD/CDQ
 - **Logic**: XOR, AND, OR, NOT, TEST
 - **Shift/Rotate**: SHL, SHR, SAR, ROL, ROR, RCL, RCR
-- **Control Flow**: JMP, Jcc, CALL, RET, INT
+- **Bit Manipulation**: BT, BTS, BTR, BTC, BSF, BSR, SETcc
+- **String Operations**: MOVS, STOS, LODS, CMPS, SCAS (with REP/REPNE prefixes)
+- **Control Flow**: JMP, Jcc, CALL, RET, INT, LEAVE
+- **Stack/Flags**: PUSHF, POPF, PUSHA, POPA
 - **I/O**: IN, OUT
 - **System**: NOP, HLT, CLI, STI, CLD, STD
 - **Special**: CPUID, RDTSC
@@ -468,7 +474,8 @@ The long-term goal is running Linux kernel self-tests. Current progress:
 |-----------|--------|-------|
 | Real mode | ✓ Done | Segment * 16 + offset addressing |
 | Basic instructions | ✓ Done | MOV, LEA, PUSH/POP, ADD/SUB, JMP, CALL/RET, OR, AND, XOR |
-| Extended instructions | ✓ Done | MOVZX/MOVSX, shifts/rotates, TEST, MUL/DIV |
+| Extended instructions | ✓ Done | MOVZX/MOVSX, shifts/rotates, TEST, MUL/DIV, bit ops |
+| String operations | ✓ Done | REP MOVS/STOS/LODS/CMPS/SCAS with prefixes |
 | UART I/O | ✓ Done | 16550A for test output |
 | Event system | ✓ Done | Async queue + epoll event loop |
 | Protected mode | ✓ Done | GDT/IDT, CR0-CR4, mode switching |
