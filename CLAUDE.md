@@ -79,10 +79,9 @@ The emulator uses UART for testing output. Tests are embedded in source files us
 # Run all tests
 zig build test
 
-# Run specific module tests
-zig test src/cpu/cpu.zig
-zig test src/memory/memory.zig
-zig test src/io/uart.zig
+# Run tests in Docker (CI/CD)
+docker build -f Dockerfile.cicd -t i686-emu-test .
+docker run --rm i686-emu-test
 ```
 
 ### Test Categories
