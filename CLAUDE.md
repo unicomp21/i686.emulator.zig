@@ -84,6 +84,21 @@ docker build -f Dockerfile.cicd -t i686-emu-test .
 docker run --rm i686-emu-test
 ```
 
+### Test Status
+
+All tests currently pass (24/24):
+
+| Test Suite | Tests | Status |
+|------------|-------|--------|
+| Root module | 2 | ✓ Pass |
+| Main/CLI | 1 | ✓ Pass |
+| Registers | 4 | ✓ Pass |
+| Memory | 6 | ✓ Pass |
+| UART | 5 | ✓ Pass |
+| Event Queue | 4 | ✓ Pass |
+| CPU (via root) | 4 | ✓ Pass |
+| I/O (via root) | 2 | ✓ Pass |
+
 ### Test Categories
 
 | Module | File | Test Focus |
@@ -385,6 +400,21 @@ std.debug.print("EIP={x:08} opcode={x:02}\n", .{ cpu.eip, opcode });
 
 ## Future Development
 
+### Roadmap to Linux kselftest
+
+The long-term goal is running Linux kernel self-tests. Current progress:
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Real mode | ✓ Done | Segment * 16 + offset addressing |
+| Basic instructions | ✓ Done | MOV, PUSH/POP, ADD/SUB, JMP, CALL/RET |
+| UART I/O | ✓ Done | 16550A for test output |
+| Event system | ✓ Done | Async queue + epoll event loop |
+| Protected mode | ☐ TODO | Required for Linux |
+| Paging | ☐ TODO | Required for Linux |
+| System calls | ☐ TODO | INT 0x80 / SYSENTER |
+| Full instruction set | ☐ TODO | ~300 more opcodes |
+
 ### Priority Features for kselftest
 
 1. **Protected Mode**
@@ -398,19 +428,19 @@ std.debug.print("EIP={x:08} opcode={x:02}\n", .{ cpu.eip, opcode });
    - SYSENTER/SYSEXIT
 
 3. **Memory Management**
-   - Paging support
-   - Page fault handling
+   - Paging support (CR0, CR3, page tables)
+   - Page fault handling (#PF)
    - TLB emulation
 
-4. **Interrupts**
+4. **Interrupts & Exceptions**
    - IDT support
    - Hardware interrupt simulation
-   - Exception handling
+   - Exception handling (#GP, #PF, #UD, etc.)
 
 5. **Additional I/O**
    - PIC (8259) emulation
-   - Timer (8254) emulation
-   - Keyboard controller
+   - PIT (8254) timer emulation
+   - Keyboard controller (8042)
 
 ## Performance Considerations
 
