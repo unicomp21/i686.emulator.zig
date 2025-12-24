@@ -62,6 +62,7 @@ pub fn build(b: *std.Build) void {
     // Tests
     // ============================================
 
+    // Run all tests through root module (handles cross-module imports)
     const lib_unit_tests = b.addTest(.{
         .root_source_file = b.path("src/root.zig"),
         .target = native_target,
@@ -76,15 +77,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
-    // CPU tests
-    const cpu_tests = b.addTest(.{
-        .root_source_file = b.path("src/cpu/cpu.zig"),
-        .target = native_target,
-        .optimize = optimize,
-    });
-    const run_cpu_tests = b.addRunArtifact(cpu_tests);
-
-    // Register tests
+    // Standalone module tests (no cross-module dependencies)
     const register_tests = b.addTest(.{
         .root_source_file = b.path("src/cpu/registers.zig"),
         .target = native_target,
@@ -92,15 +85,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_register_tests = b.addRunArtifact(register_tests);
 
-    // Instruction tests
-    const instruction_tests = b.addTest(.{
-        .root_source_file = b.path("src/cpu/instructions.zig"),
-        .target = native_target,
-        .optimize = optimize,
-    });
-    const run_instruction_tests = b.addRunArtifact(instruction_tests);
-
-    // Memory tests
     const memory_tests = b.addTest(.{
         .root_source_file = b.path("src/memory/memory.zig"),
         .target = native_target,
@@ -108,15 +92,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_memory_tests = b.addRunArtifact(memory_tests);
 
-    // I/O tests
-    const io_tests = b.addTest(.{
-        .root_source_file = b.path("src/io/io.zig"),
-        .target = native_target,
-        .optimize = optimize,
-    });
-    const run_io_tests = b.addRunArtifact(io_tests);
-
-    // UART tests
     const uart_tests = b.addTest(.{
         .root_source_file = b.path("src/io/uart.zig"),
         .target = native_target,
@@ -124,24 +99,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_uart_tests = b.addRunArtifact(uart_tests);
 
-    // Debug tests
-    const debug_tests = b.addTest(.{
-        .root_source_file = b.path("src/debug/debugger.zig"),
+    const queue_tests = b.addTest(.{
+        .root_source_file = b.path("src/async/queue.zig"),
         .target = native_target,
         .optimize = optimize,
     });
-    const run_debug_tests = b.addRunArtifact(debug_tests);
+    const run_queue_tests = b.addRunArtifact(queue_tests);
 
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
-    test_step.dependOn(&run_cpu_tests.step);
     test_step.dependOn(&run_register_tests.step);
-    test_step.dependOn(&run_instruction_tests.step);
     test_step.dependOn(&run_memory_tests.step);
-    test_step.dependOn(&run_io_tests.step);
     test_step.dependOn(&run_uart_tests.step);
-    test_step.dependOn(&run_debug_tests.step);
+    test_step.dependOn(&run_queue_tests.step);
 
     // ============================================
     // Documentation

@@ -309,7 +309,7 @@ test "cpu initialization" {
     var io_ctrl = io.IoController.init(allocator);
     defer io_ctrl.deinit();
 
-    var cpu = Cpu.init(&mem, &io_ctrl);
+    const cpu = Cpu.init(&mem, &io_ctrl);
     try std.testing.expectEqual(@as(u32, 0), cpu.eip);
     try std.testing.expect(!cpu.halted);
 }
