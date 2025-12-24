@@ -93,6 +93,17 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             }
         },
 
+        // LEA r16/32, m
+        0x8D => {
+            const modrm = try fetchModRM(cpu);
+            const addr = try calculateEffectiveAddress(cpu, modrm);
+            if (cpu.prefix.operand_size_override) {
+                cpu.regs.setReg16(modrm.reg, @truncate(addr));
+            } else {
+                cpu.regs.setReg32(modrm.reg, addr);
+            }
+        },
+
         // MOV AL, moffs8
         0xA0 => {
             const addr = try fetchDword(cpu);
@@ -337,6 +348,51 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             }
         },
 
+        // TEST r/m8, r8
+        0x84 => {
+            const modrm = try fetchModRM(cpu);
+            const dst = try readRM8(cpu, modrm);
+            const src = cpu.regs.getReg8(modrm.reg);
+            const result = dst & src;
+            cpu.flags.updateArithmetic8(result, false, false);
+        },
+
+        // TEST r/m16/32, r16/32
+        0x85 => {
+            const modrm = try fetchModRM(cpu);
+            if (cpu.prefix.operand_size_override) {
+                const dst = try readRM16(cpu, modrm);
+                const src = cpu.regs.getReg16(modrm.reg);
+                const result = dst & src;
+                cpu.flags.updateArithmetic16(result, false, false);
+            } else {
+                const dst = try readRM32(cpu, modrm);
+                const src = cpu.regs.getReg32(modrm.reg);
+                const result = dst & src;
+                cpu.flags.updateArithmetic32(result, false, false);
+            }
+        },
+
+        // TEST AL, imm8
+        0xA8 => {
+            const imm = try fetchByte(cpu);
+            const result = @as(u8, @truncate(cpu.regs.eax)) & imm;
+            cpu.flags.updateArithmetic8(result, false, false);
+        },
+
+        // TEST EAX, imm32
+        0xA9 => {
+            if (cpu.prefix.operand_size_override) {
+                const imm = try fetchWord(cpu);
+                const result = @as(u16, @truncate(cpu.regs.eax)) & imm;
+                cpu.flags.updateArithmetic16(result, false, false);
+            } else {
+                const imm = try fetchDword(cpu);
+                const result = cpu.regs.eax & imm;
+                cpu.flags.updateArithmetic32(result, false, false);
+            }
+        },
+
         // XOR r/m8, r8
         0x30 => {
             const modrm = try fetchModRM(cpu);
@@ -511,6 +567,16 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             try executeGroup1(cpu, opcode);
         },
 
+        // Group 2 - Shift/Rotate (C0, C1, D0, D1, D2, D3)
+        0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3 => {
+            try executeGroup2(cpu, opcode);
+        },
+
+        // Group 3 - Unary operations (F6, F7)
+        0xF6, 0xF7 => {
+            try executeGroup3(cpu, opcode);
+        },
+
         else => {
             cpu.dumpInstructionHistory();
             std.debug.print("\nINVALID OPCODE: {X:02} at {X:04}:{X:08}\n", .{ opcode, cpu.current_instr_cs, cpu.current_instr_eip });
@@ -622,6 +688,44 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
         // INVD (Invalidate Cache)
         0x08 => {
             // No-op for emulator
+        },
+
+        // MOVZX r32, r/m8
+        0xB6 => {
+            const modrm = try fetchModRM(cpu);
+            const value = try readRM8(cpu, modrm);
+            if (cpu.prefix.operand_size_override) {
+                cpu.regs.setReg16(modrm.reg, @as(u16, value));
+            } else {
+                cpu.regs.setReg32(modrm.reg, @as(u32, value));
+            }
+        },
+
+        // MOVZX r32, r/m16
+        0xB7 => {
+            const modrm = try fetchModRM(cpu);
+            const value = try readRM16(cpu, modrm);
+            // Note: 0F B7 is always 32-bit destination (MOVZX r32, r/m16)
+            cpu.regs.setReg32(modrm.reg, @as(u32, value));
+        },
+
+        // MOVSX r32, r/m8
+        0xBE => {
+            const modrm = try fetchModRM(cpu);
+            const value: i8 = @bitCast(try readRM8(cpu, modrm));
+            if (cpu.prefix.operand_size_override) {
+                cpu.regs.setReg16(modrm.reg, @bitCast(@as(i16, value)));
+            } else {
+                cpu.regs.setReg32(modrm.reg, @bitCast(@as(i32, value)));
+            }
+        },
+
+        // MOVSX r32, r/m16
+        0xBF => {
+            const modrm = try fetchModRM(cpu);
+            const value: i16 = @bitCast(try readRM16(cpu, modrm));
+            // Note: 0F BF is always 32-bit destination (MOVSX r32, r/m16)
+            cpu.regs.setReg32(modrm.reg, @bitCast(@as(i32, value)));
         },
 
         else => {
@@ -775,6 +879,426 @@ fn executeGroup1(cpu: *Cpu, opcode: u8) !void {
             }
         },
         else => {},
+    }
+}
+
+/// Execute Group 2 instructions (shift/rotate)
+fn executeGroup2(cpu: *Cpu, opcode: u8) !void {
+    const modrm = try fetchModRM(cpu);
+
+    // Get shift count
+    const count: u5 = switch (opcode) {
+        0xC0, 0xC1 => @truncate(try fetchByte(cpu)), // imm8
+        0xD0, 0xD1 => 1, // shift by 1
+        0xD2, 0xD3 => @truncate(cpu.regs.ecx), // CL
+        else => unreachable,
+    };
+
+    // 8-bit or 32-bit operation
+    const is_8bit = opcode == 0xC0 or opcode == 0xD0 or opcode == 0xD2;
+
+    if (is_8bit) {
+        const value = try readRM8(cpu, modrm);
+        const result = shiftRotate8(cpu, modrm.reg, value, count);
+        try writeRM8(cpu, modrm, result);
+    } else {
+        if (cpu.prefix.operand_size_override) {
+            const value = try readRM16(cpu, modrm);
+            const result = shiftRotate16(cpu, modrm.reg, value, count);
+            try writeRM16(cpu, modrm, result);
+        } else {
+            const value = try readRM32(cpu, modrm);
+            const result = shiftRotate32(cpu, modrm.reg, value, count);
+            try writeRM32(cpu, modrm, result);
+        }
+    }
+}
+
+fn shiftRotate8(cpu: *Cpu, op: u3, value: u8, count: u5) u8 {
+    if (count == 0) return value;
+
+    var result: u8 = value;
+    var cf = cpu.flags.carry;
+
+    switch (op) {
+        0 => { // ROL
+            const masked = count & 7;
+            result = (value << @truncate(masked)) | (value >> @truncate(8 - masked));
+            cf = (result & 1) != 0;
+        },
+        1 => { // ROR
+            const masked = count & 7;
+            result = (value >> @truncate(masked)) | (value << @truncate(8 - masked));
+            cf = (result & 0x80) != 0;
+        },
+        2 => { // RCL
+            for (0..count) |_| {
+                const new_cf = (result & 0x80) != 0;
+                result = (result << 1) | @as(u8, @intFromBool(cf));
+                cf = new_cf;
+            }
+        },
+        3 => { // RCR
+            for (0..count) |_| {
+                const new_cf = (result & 1) != 0;
+                result = (result >> 1) | (@as(u8, @intFromBool(cf)) << 7);
+                cf = new_cf;
+            }
+        },
+        4, 6 => { // SHL/SAL
+            cf = (value >> @truncate(8 - count)) & 1 != 0;
+            result = value << @truncate(count);
+        },
+        5 => { // SHR
+            cf = (value >> @truncate(count - 1)) & 1 != 0;
+            result = value >> @truncate(count);
+        },
+        7 => { // SAR
+            cf = (value >> @truncate(count - 1)) & 1 != 0;
+            const signed: i8 = @bitCast(value);
+            result = @bitCast(signed >> @truncate(count));
+        },
+    }
+
+    cpu.flags.carry = cf;
+    // Update other flags for shift operations (not rotates)
+    if (op >= 4) {
+        cpu.flags.zero = result == 0;
+        cpu.flags.sign = (result & 0x80) != 0;
+        cpu.flags.parity = @popCount(result) % 2 == 0;
+        if (count == 1) {
+            // Overflow is defined only for 1-bit shifts
+            cpu.flags.overflow = switch (op) {
+                4, 6 => (result & 0x80) != (value & 0x80), // SHL
+                5 => (value & 0x80) != 0, // SHR
+                7 => false, // SAR never overflows
+                else => false,
+            };
+        }
+    }
+
+    return result;
+}
+
+fn shiftRotate16(cpu: *Cpu, op: u3, value: u16, count: u5) u16 {
+    if (count == 0) return value;
+
+    var result: u16 = value;
+    var cf = cpu.flags.carry;
+
+    switch (op) {
+        0 => { // ROL
+            const masked = count & 15;
+            result = (value << @truncate(masked)) | (value >> @truncate(16 - masked));
+            cf = (result & 1) != 0;
+        },
+        1 => { // ROR
+            const masked = count & 15;
+            result = (value >> @truncate(masked)) | (value << @truncate(16 - masked));
+            cf = (result & 0x8000) != 0;
+        },
+        2 => { // RCL
+            for (0..count) |_| {
+                const new_cf = (result & 0x8000) != 0;
+                result = (result << 1) | @as(u16, @intFromBool(cf));
+                cf = new_cf;
+            }
+        },
+        3 => { // RCR
+            for (0..count) |_| {
+                const new_cf = (result & 1) != 0;
+                result = (result >> 1) | (@as(u16, @intFromBool(cf)) << 15);
+                cf = new_cf;
+            }
+        },
+        4, 6 => { // SHL/SAL
+            cf = (value >> @truncate(16 - count)) & 1 != 0;
+            result = value << @truncate(count);
+        },
+        5 => { // SHR
+            cf = (value >> @truncate(count - 1)) & 1 != 0;
+            result = value >> @truncate(count);
+        },
+        7 => { // SAR
+            cf = (value >> @truncate(count - 1)) & 1 != 0;
+            const signed: i16 = @bitCast(value);
+            result = @bitCast(signed >> @truncate(count));
+        },
+    }
+
+    cpu.flags.carry = cf;
+    if (op >= 4) {
+        cpu.flags.zero = result == 0;
+        cpu.flags.sign = (result & 0x8000) != 0;
+        cpu.flags.parity = @popCount(@as(u8, @truncate(result))) % 2 == 0;
+        if (count == 1) {
+            cpu.flags.overflow = switch (op) {
+                4, 6 => (result & 0x8000) != (value & 0x8000),
+                5 => (value & 0x8000) != 0,
+                7 => false,
+                else => false,
+            };
+        }
+    }
+
+    return result;
+}
+
+fn shiftRotate32(cpu: *Cpu, op: u3, value: u32, count: u5) u32 {
+    if (count == 0) return value;
+
+    var result: u32 = value;
+    var cf = cpu.flags.carry;
+
+    switch (op) {
+        0 => { // ROL
+            result = (value << count) | (value >> @truncate(32 - @as(u6, count)));
+            cf = (result & 1) != 0;
+        },
+        1 => { // ROR
+            result = (value >> count) | (value << @truncate(32 - @as(u6, count)));
+            cf = (result & 0x80000000) != 0;
+        },
+        2 => { // RCL
+            for (0..count) |_| {
+                const new_cf = (result & 0x80000000) != 0;
+                result = (result << 1) | @as(u32, @intFromBool(cf));
+                cf = new_cf;
+            }
+        },
+        3 => { // RCR
+            for (0..count) |_| {
+                const new_cf = (result & 1) != 0;
+                result = (result >> 1) | (@as(u32, @intFromBool(cf)) << 31);
+                cf = new_cf;
+            }
+        },
+        4, 6 => { // SHL/SAL
+            cf = (value >> @truncate(32 - @as(u6, count))) & 1 != 0;
+            result = value << count;
+        },
+        5 => { // SHR
+            cf = (value >> @truncate(count - 1)) & 1 != 0;
+            result = value >> count;
+        },
+        7 => { // SAR
+            cf = (value >> @truncate(count - 1)) & 1 != 0;
+            const signed: i32 = @bitCast(value);
+            result = @bitCast(signed >> count);
+        },
+    }
+
+    cpu.flags.carry = cf;
+    if (op >= 4) {
+        cpu.flags.zero = result == 0;
+        cpu.flags.sign = (result & 0x80000000) != 0;
+        cpu.flags.parity = @popCount(@as(u8, @truncate(result))) % 2 == 0;
+        if (count == 1) {
+            cpu.flags.overflow = switch (op) {
+                4, 6 => (result & 0x80000000) != (value & 0x80000000),
+                5 => (value & 0x80000000) != 0,
+                7 => false,
+                else => false,
+            };
+        }
+    }
+
+    return result;
+}
+
+/// Execute Group 3 instructions (unary operations: TEST, NOT, NEG, MUL, IMUL, DIV, IDIV)
+fn executeGroup3(cpu: *Cpu, opcode: u8) !void {
+    const modrm = try fetchModRM(cpu);
+
+    if (opcode == 0xF6) {
+        // 8-bit operations
+        switch (modrm.reg) {
+            0, 1 => { // TEST r/m8, imm8
+                const value = try readRM8(cpu, modrm);
+                const imm = try fetchByte(cpu);
+                const result = value & imm;
+                cpu.flags.updateArithmetic8(result, false, false);
+            },
+            2 => { // NOT r/m8
+                const value = try readRM8(cpu, modrm);
+                try writeRM8(cpu, modrm, ~value);
+            },
+            3 => { // NEG r/m8
+                const value = try readRM8(cpu, modrm);
+                const result = 0 -% value;
+                cpu.flags.carry = value != 0;
+                cpu.flags.overflow = value == 0x80;
+                cpu.flags.zero = result == 0;
+                cpu.flags.sign = (result & 0x80) != 0;
+                cpu.flags.parity = @popCount(result) % 2 == 0;
+                try writeRM8(cpu, modrm, result);
+            },
+            4 => { // MUL AL, r/m8
+                const value = try readRM8(cpu, modrm);
+                const al: u8 = @truncate(cpu.regs.eax);
+                const result: u16 = @as(u16, al) * @as(u16, value);
+                cpu.regs.setReg16(0, result); // AX = AL * r/m8
+                cpu.flags.carry = (result >> 8) != 0;
+                cpu.flags.overflow = cpu.flags.carry;
+            },
+            5 => { // IMUL AL, r/m8
+                const value: i8 = @bitCast(try readRM8(cpu, modrm));
+                const al: i8 = @bitCast(@as(u8, @truncate(cpu.regs.eax)));
+                const result: i16 = @as(i16, al) * @as(i16, value);
+                cpu.regs.setReg16(0, @bitCast(result));
+                const ah: i8 = @truncate(result >> 8);
+                const sign_extended = (result >> 7) == 0 or (result >> 7) == -1;
+                cpu.flags.carry = !sign_extended;
+                cpu.flags.overflow = !sign_extended;
+                _ = ah;
+            },
+            6 => { // DIV AX, r/m8
+                const divisor = try readRM8(cpu, modrm);
+                if (divisor == 0) return CpuError.DivisionByZero;
+                const dividend: u16 = cpu.regs.getReg16(0);
+                const quotient = dividend / @as(u16, divisor);
+                const remainder = dividend % @as(u16, divisor);
+                if (quotient > 0xFF) return CpuError.DivisionByZero; // Overflow
+                cpu.regs.setReg8(0, @truncate(quotient)); // AL
+                cpu.regs.setReg8(4, @truncate(remainder)); // AH
+            },
+            7 => { // IDIV AX, r/m8
+                const divisor: i8 = @bitCast(try readRM8(cpu, modrm));
+                if (divisor == 0) return CpuError.DivisionByZero;
+                const dividend: i16 = @bitCast(cpu.regs.getReg16(0));
+                const quotient = @divTrunc(dividend, @as(i16, divisor));
+                const remainder = @rem(dividend, @as(i16, divisor));
+                if (quotient > 127 or quotient < -128) return CpuError.DivisionByZero;
+                cpu.regs.setReg8(0, @bitCast(@as(i8, @truncate(quotient)))); // AL
+                cpu.regs.setReg8(4, @bitCast(@as(i8, @truncate(remainder)))); // AH
+            },
+        }
+    } else {
+        // 32-bit operations (or 16-bit with prefix)
+        if (cpu.prefix.operand_size_override) {
+            switch (modrm.reg) {
+                0, 1 => { // TEST r/m16, imm16
+                    const value = try readRM16(cpu, modrm);
+                    const imm = try fetchWord(cpu);
+                    const result = value & imm;
+                    cpu.flags.updateArithmetic16(result, false, false);
+                },
+                2 => { // NOT r/m16
+                    const value = try readRM16(cpu, modrm);
+                    try writeRM16(cpu, modrm, ~value);
+                },
+                3 => { // NEG r/m16
+                    const value = try readRM16(cpu, modrm);
+                    const result = 0 -% value;
+                    cpu.flags.carry = value != 0;
+                    cpu.flags.overflow = value == 0x8000;
+                    cpu.flags.zero = result == 0;
+                    cpu.flags.sign = (result & 0x8000) != 0;
+                    cpu.flags.parity = @popCount(@as(u8, @truncate(result))) % 2 == 0;
+                    try writeRM16(cpu, modrm, result);
+                },
+                4 => { // MUL DX:AX, r/m16
+                    const value = try readRM16(cpu, modrm);
+                    const ax: u16 = cpu.regs.getReg16(0);
+                    const result: u32 = @as(u32, ax) * @as(u32, value);
+                    cpu.regs.setReg16(0, @truncate(result)); // AX
+                    cpu.regs.setReg16(2, @truncate(result >> 16)); // DX
+                    cpu.flags.carry = (result >> 16) != 0;
+                    cpu.flags.overflow = cpu.flags.carry;
+                },
+                5 => { // IMUL DX:AX, r/m16
+                    const value: i16 = @bitCast(try readRM16(cpu, modrm));
+                    const ax: i16 = @bitCast(cpu.regs.getReg16(0));
+                    const result: i32 = @as(i32, ax) * @as(i32, value);
+                    cpu.regs.setReg16(0, @truncate(@as(u32, @bitCast(result)))); // AX
+                    cpu.regs.setReg16(2, @truncate(@as(u32, @bitCast(result)) >> 16)); // DX
+                    const sign_extended = (result >> 15) == 0 or (result >> 15) == -1;
+                    cpu.flags.carry = !sign_extended;
+                    cpu.flags.overflow = !sign_extended;
+                },
+                6 => { // DIV DX:AX, r/m16
+                    const divisor = try readRM16(cpu, modrm);
+                    if (divisor == 0) return CpuError.DivisionByZero;
+                    const dividend: u32 = (@as(u32, cpu.regs.getReg16(2)) << 16) | @as(u32, cpu.regs.getReg16(0));
+                    const quotient = dividend / @as(u32, divisor);
+                    const remainder = dividend % @as(u32, divisor);
+                    if (quotient > 0xFFFF) return CpuError.DivisionByZero;
+                    cpu.regs.setReg16(0, @truncate(quotient)); // AX
+                    cpu.regs.setReg16(2, @truncate(remainder)); // DX
+                },
+                7 => { // IDIV DX:AX, r/m16
+                    const divisor: i16 = @bitCast(try readRM16(cpu, modrm));
+                    if (divisor == 0) return CpuError.DivisionByZero;
+                    const dividend: i32 = @bitCast((@as(u32, cpu.regs.getReg16(2)) << 16) | @as(u32, cpu.regs.getReg16(0)));
+                    const quotient = @divTrunc(dividend, @as(i32, divisor));
+                    const remainder = @rem(dividend, @as(i32, divisor));
+                    if (quotient > 32767 or quotient < -32768) return CpuError.DivisionByZero;
+                    cpu.regs.setReg16(0, @bitCast(@as(i16, @truncate(quotient)))); // AX
+                    cpu.regs.setReg16(2, @bitCast(@as(i16, @truncate(remainder)))); // DX
+                },
+            }
+        } else {
+            switch (modrm.reg) {
+                0, 1 => { // TEST r/m32, imm32
+                    const value = try readRM32(cpu, modrm);
+                    const imm = try fetchDword(cpu);
+                    const result = value & imm;
+                    cpu.flags.updateArithmetic32(result, false, false);
+                },
+                2 => { // NOT r/m32
+                    const value = try readRM32(cpu, modrm);
+                    try writeRM32(cpu, modrm, ~value);
+                },
+                3 => { // NEG r/m32
+                    const value = try readRM32(cpu, modrm);
+                    const result = 0 -% value;
+                    cpu.flags.carry = value != 0;
+                    cpu.flags.overflow = value == 0x80000000;
+                    cpu.flags.zero = result == 0;
+                    cpu.flags.sign = (result & 0x80000000) != 0;
+                    cpu.flags.parity = @popCount(@as(u8, @truncate(result))) % 2 == 0;
+                    try writeRM32(cpu, modrm, result);
+                },
+                4 => { // MUL EDX:EAX, r/m32
+                    const value = try readRM32(cpu, modrm);
+                    const result: u64 = @as(u64, cpu.regs.eax) * @as(u64, value);
+                    cpu.regs.eax = @truncate(result);
+                    cpu.regs.edx = @truncate(result >> 32);
+                    cpu.flags.carry = cpu.regs.edx != 0;
+                    cpu.flags.overflow = cpu.flags.carry;
+                },
+                5 => { // IMUL EDX:EAX, r/m32
+                    const value: i32 = @bitCast(try readRM32(cpu, modrm));
+                    const eax: i32 = @bitCast(cpu.regs.eax);
+                    const result: i64 = @as(i64, eax) * @as(i64, value);
+                    cpu.regs.eax = @truncate(@as(u64, @bitCast(result)));
+                    cpu.regs.edx = @truncate(@as(u64, @bitCast(result)) >> 32);
+                    const sign_extended = (result >> 31) == 0 or (result >> 31) == -1;
+                    cpu.flags.carry = !sign_extended;
+                    cpu.flags.overflow = !sign_extended;
+                },
+                6 => { // DIV EDX:EAX, r/m32
+                    const divisor = try readRM32(cpu, modrm);
+                    if (divisor == 0) return CpuError.DivisionByZero;
+                    const dividend: u64 = (@as(u64, cpu.regs.edx) << 32) | @as(u64, cpu.regs.eax);
+                    const quotient = dividend / @as(u64, divisor);
+                    const remainder = dividend % @as(u64, divisor);
+                    if (quotient > 0xFFFFFFFF) return CpuError.DivisionByZero;
+                    cpu.regs.eax = @truncate(quotient);
+                    cpu.regs.edx = @truncate(remainder);
+                },
+                7 => { // IDIV EDX:EAX, r/m32
+                    const divisor: i32 = @bitCast(try readRM32(cpu, modrm));
+                    if (divisor == 0) return CpuError.DivisionByZero;
+                    const dividend: i64 = @bitCast((@as(u64, cpu.regs.edx) << 32) | @as(u64, cpu.regs.eax));
+                    const quotient = @divTrunc(dividend, @as(i64, divisor));
+                    const remainder = @rem(dividend, @as(i64, divisor));
+                    if (quotient > 2147483647 or quotient < -2147483648) return CpuError.DivisionByZero;
+                    cpu.regs.eax = @bitCast(@as(i32, @truncate(quotient)));
+                    cpu.regs.edx = @bitCast(@as(i32, @truncate(remainder)));
+                },
+            }
+        }
     }
 }
 

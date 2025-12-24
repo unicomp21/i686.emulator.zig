@@ -528,3 +528,239 @@ test "integration: paging identity map" {
     try std.testing.expect(output != null);
     try std.testing.expectEqualStrings("G", output.?);
 }
+
+// Test: LEA instruction
+test "integration: lea" {
+    const allocator = std.testing.allocator;
+
+    // Test LEA with [base + index*scale + disp]
+    // lea eax, [ebx + ecx*4 + 0x100]
+    // if eax == ebx + ecx*4 + 0x100, output 'L'
+    const code = [_]u8{
+        // mov ebx, 0x1000 - B8+3 = BB
+        0xBB, 0x00, 0x10, 0x00, 0x00,
+        // mov ecx, 0x10 - B8+1 = B9
+        0xB9, 0x10, 0x00, 0x00, 0x00,
+        // lea eax, [ebx + ecx*4 + 0x100] - 8D 84 8B 00 01 00 00
+        // ModRM: mod=10 (disp32), reg=000 (eax), rm=100 (SIB)
+        // SIB: scale=10 (4), index=001 (ecx), base=011 (ebx)
+        0x8D, 0x84, 0x8B, 0x00, 0x01, 0x00, 0x00,
+        // Expected: 0x1000 + 0x10*4 + 0x100 = 0x1000 + 0x40 + 0x100 = 0x1140
+        // cmp eax, 0x1140 - 3D 40 11 00 00
+        0x3D, 0x40, 0x11, 0x00, 0x00,
+        // jne fail
+        0x75, 0x09,
+        // mov edx, 0x3F8
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        // mov al, 'L'
+        0xB0, 'L',
+        // out dx, al
+        0xEE,
+        // hlt
+        0xF4,
+        // fail: hlt
+        0xF4,
+    };
+
+    var emu = try Emulator.init(allocator, .{
+        .memory_size = 1024 * 1024,
+        .enable_uart = true,
+    });
+    defer emu.deinit();
+
+    try emu.loadBinary(&code, 0x0000);
+    try emu.run();
+
+    const output = emu.getUartOutput();
+    try std.testing.expect(output != null);
+    try std.testing.expectEqualStrings("L", output.?);
+}
+
+// Test: MOVZX and MOVSX instructions
+test "integration: movzx movsx" {
+    const allocator = std.testing.allocator;
+
+    // Test MOVZX (zero extend) and MOVSX (sign extend)
+    const code = [_]u8{
+        // mov byte [0x100], 0x80 - C6 05 00 01 00 00 80
+        0xC6, 0x05, 0x00, 0x01, 0x00, 0x00, 0x80,
+        // movzx eax, byte [0x100] - 0F B6 05 00 01 00 00
+        0x0F, 0xB6, 0x05, 0x00, 0x01, 0x00, 0x00,
+        // cmp eax, 0x80 (should be 0x00000080)
+        0x3D, 0x80, 0x00, 0x00, 0x00,
+        // jne fail
+        0x75, 0x1C,
+        // movsx ebx, byte [0x100] - 0F BE 1D 00 01 00 00
+        0x0F, 0xBE, 0x1D, 0x00, 0x01, 0x00, 0x00,
+        // cmp ebx, 0xFFFFFF80 (sign extended -128)
+        0x81, 0xFB, 0x80, 0xFF, 0xFF, 0xFF,
+        // jne fail
+        0x75, 0x0E,
+        // success: output 'Z'
+        // mov edx, 0x3F8
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        // mov al, 'Z'
+        0xB0, 'Z',
+        // out dx, al
+        0xEE,
+        // hlt
+        0xF4,
+        // fail: hlt
+        0xF4,
+    };
+
+    var emu = try Emulator.init(allocator, .{
+        .memory_size = 1024 * 1024,
+        .enable_uart = true,
+    });
+    defer emu.deinit();
+
+    try emu.loadBinary(&code, 0x0000);
+    try emu.run();
+
+    const output = emu.getUartOutput();
+    try std.testing.expect(output != null);
+    try std.testing.expectEqualStrings("Z", output.?);
+}
+
+// Test: Shift instructions (SHL, SHR, SAR)
+test "integration: shifts" {
+    const allocator = std.testing.allocator;
+
+    // Test SHL, SHR, SAR
+    const code = [_]u8{
+        // mov eax, 1 - B8 01 00 00 00
+        0xB8, 0x01, 0x00, 0x00, 0x00,
+        // shl eax, 4 - C1 E0 04 (shift left by 4, result = 0x10)
+        0xC1, 0xE0, 0x04,
+        // cmp eax, 0x10
+        0x3D, 0x10, 0x00, 0x00, 0x00,
+        // jne fail
+        0x75, 0x24,
+        // mov ebx, 0x80 - BB 80 00 00 00
+        0xBB, 0x80, 0x00, 0x00, 0x00,
+        // shr ebx, 3 - C1 EB 03 (shift right by 3, result = 0x10)
+        0xC1, 0xEB, 0x03,
+        // cmp ebx, 0x10
+        0x81, 0xFB, 0x10, 0x00, 0x00, 0x00,
+        // jne fail
+        0x75, 0x13,
+        // mov ecx, 0xFFFFFF80 (-128) - B9 80 FF FF FF
+        0xB9, 0x80, 0xFF, 0xFF, 0xFF,
+        // sar ecx, 2 - C1 F9 02 (arithmetic shift right by 2)
+        0xC1, 0xF9, 0x02,
+        // cmp ecx, 0xFFFFFFE0 (-32) - 81 F9 E0 FF FF FF
+        0x81, 0xF9, 0xE0, 0xFF, 0xFF, 0xFF,
+        // jne fail
+        0x75, 0x09,
+        // success: output 'S'
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        0xB0, 'S',
+        0xEE,
+        0xF4,
+        // fail: hlt
+        0xF4,
+    };
+
+    var emu = try Emulator.init(allocator, .{
+        .memory_size = 1024 * 1024,
+        .enable_uart = true,
+    });
+    defer emu.deinit();
+
+    try emu.loadBinary(&code, 0x0000);
+    try emu.run();
+
+    const output = emu.getUartOutput();
+    try std.testing.expect(output != null);
+    try std.testing.expectEqualStrings("S", output.?);
+}
+
+// Test: TEST instruction
+test "integration: test instruction" {
+    const allocator = std.testing.allocator;
+
+    // Test the TEST instruction (AND that only affects flags)
+    const code = [_]u8{
+        // mov eax, 0x0F - B8 0F 00 00 00
+        0xB8, 0x0F, 0x00, 0x00, 0x00,
+        // test eax, 0x10 - A9 10 00 00 00 (should set ZF=1)
+        0xA9, 0x10, 0x00, 0x00, 0x00,
+        // jnz fail (if not zero, fail)
+        0x75, 0x11,
+        // test eax, 0x08 - A9 08 00 00 00 (should set ZF=0)
+        0xA9, 0x08, 0x00, 0x00, 0x00,
+        // jz fail (if zero, fail)
+        0x74, 0x09,
+        // success: output 'T'
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        0xB0, 'T',
+        0xEE,
+        0xF4,
+        // fail: hlt
+        0xF4,
+    };
+
+    var emu = try Emulator.init(allocator, .{
+        .memory_size = 1024 * 1024,
+        .enable_uart = true,
+    });
+    defer emu.deinit();
+
+    try emu.loadBinary(&code, 0x0000);
+    try emu.run();
+
+    const output = emu.getUartOutput();
+    try std.testing.expect(output != null);
+    try std.testing.expectEqualStrings("T", output.?);
+}
+
+// Test: MUL and DIV instructions
+test "integration: mul div" {
+    const allocator = std.testing.allocator;
+
+    // Test MUL and DIV
+    const code = [_]u8{
+        // mov eax, 100 - B8 64 00 00 00
+        0xB8, 0x64, 0x00, 0x00, 0x00,
+        // mov ecx, 5 - B9 05 00 00 00
+        0xB9, 0x05, 0x00, 0x00, 0x00,
+        // mul ecx - F7 E1 (edx:eax = eax * ecx = 500)
+        0xF7, 0xE1,
+        // cmp eax, 500 - 3D F4 01 00 00
+        0x3D, 0xF4, 0x01, 0x00, 0x00,
+        // jne fail
+        0x75, 0x16,
+        // Now divide 500 by 10
+        // mov ecx, 10 - B9 0A 00 00 00
+        0xB9, 0x0A, 0x00, 0x00, 0x00,
+        // xor edx, edx - 31 D2
+        0x31, 0xD2,
+        // div ecx - F7 F1 (eax = 50, edx = 0)
+        0xF7, 0xF1,
+        // cmp eax, 50 - 3D 32 00 00 00
+        0x3D, 0x32, 0x00, 0x00, 0x00,
+        // jne fail
+        0x75, 0x09,
+        // success: output 'M'
+        0xBA, 0xF8, 0x03, 0x00, 0x00,
+        0xB0, 'M',
+        0xEE,
+        0xF4,
+        // fail: hlt
+        0xF4,
+    };
+
+    var emu = try Emulator.init(allocator, .{
+        .memory_size = 1024 * 1024,
+        .enable_uart = true,
+    });
+    defer emu.deinit();
+
+    try emu.loadBinary(&code, 0x0000);
+    try emu.run();
+
+    const output = emu.getUartOutput();
+    try std.testing.expect(output != null);
+    try std.testing.expectEqualStrings("M", output.?);
+}
