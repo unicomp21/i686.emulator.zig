@@ -295,6 +295,144 @@ pub const CR4 = packed struct {
     }
 };
 
+/// Page Directory Entry (4 bytes)
+/// Points to a page table or a 4MB page (if PSE enabled)
+pub const PageDirectoryEntry = packed struct {
+    /// Present bit - page is in memory
+    present: bool = false,
+    /// Read/Write - 0 = read-only, 1 = read/write
+    rw: bool = false,
+    /// User/Supervisor - 0 = supervisor only, 1 = user accessible
+    us: bool = false,
+    /// Page-level Write-Through
+    pwt: bool = false,
+    /// Page-level Cache Disable
+    pcd: bool = false,
+    /// Accessed - set by CPU on access
+    accessed: bool = false,
+    /// Dirty (only for 4MB pages with PSE)
+    dirty: bool = false,
+    /// Page Size - 0 = 4KB pages (points to PT), 1 = 4MB page (PSE)
+    ps: bool = false,
+    /// Global (ignored for PDE)
+    global: bool = false,
+    /// Available for OS use
+    avl: u3 = 0,
+    /// Page Table Base Address (4KB aligned) or 4MB page frame
+    page_table_base: u20 = 0,
+
+    const Self = @This();
+
+    pub fn fromU32(value: u32) Self {
+        return @bitCast(value);
+    }
+
+    pub fn toU32(self: Self) u32 {
+        return @bitCast(self);
+    }
+
+    /// Get page table physical address (for 4KB page tables)
+    pub fn getPageTableAddress(self: Self) u32 {
+        return @as(u32, self.page_table_base) << 12;
+    }
+
+    /// Get 4MB page physical address (for PSE)
+    pub fn get4MBPageAddress(self: Self) u32 {
+        // For 4MB pages, bits 21:12 must be 0, and bits 31:22 are the frame
+        return @as(u32, self.page_table_base) << 12;
+    }
+};
+
+/// Page Table Entry (4 bytes)
+/// Points to a 4KB page frame
+pub const PageTableEntry = packed struct {
+    /// Present bit - page is in memory
+    present: bool = false,
+    /// Read/Write - 0 = read-only, 1 = read/write
+    rw: bool = false,
+    /// User/Supervisor - 0 = supervisor only, 1 = user accessible
+    us: bool = false,
+    /// Page-level Write-Through
+    pwt: bool = false,
+    /// Page-level Cache Disable
+    pcd: bool = false,
+    /// Accessed - set by CPU on access
+    accessed: bool = false,
+    /// Dirty - set by CPU on write
+    dirty: bool = false,
+    /// PAT (Page Attribute Table) - not used on i686 without PAT
+    pat: bool = false,
+    /// Global - if CR4.PGE=1, page is not flushed from TLB on CR3 write
+    global: bool = false,
+    /// Available for OS use
+    avl: u3 = 0,
+    /// Page Frame Address (4KB aligned)
+    page_frame: u20 = 0,
+
+    const Self = @This();
+
+    pub fn fromU32(value: u32) Self {
+        return @bitCast(value);
+    }
+
+    pub fn toU32(self: Self) u32 {
+        return @bitCast(self);
+    }
+
+    /// Get page frame physical address
+    pub fn getPageFrameAddress(self: Self) u32 {
+        return @as(u32, self.page_frame) << 12;
+    }
+};
+
+/// Page Fault Error Code (pushed onto stack during #PF)
+pub const PageFaultErrorCode = packed struct {
+    /// P - 0 = non-present page, 1 = protection violation
+    present: bool = false,
+    /// W/R - 0 = read access, 1 = write access
+    write: bool = false,
+    /// U/S - 0 = supervisor mode, 1 = user mode
+    user: bool = false,
+    /// RSVD - 1 = reserved bit set in page structure
+    reserved_bit: bool = false,
+    /// I/D - 1 = instruction fetch (only with NX support)
+    instruction_fetch: bool = false,
+    /// Reserved bits
+    reserved: u27 = 0,
+
+    const Self = @This();
+
+    pub fn toU32(self: Self) u32 {
+        return @bitCast(self);
+    }
+
+    pub fn fromU32(value: u32) Self {
+        return @bitCast(value);
+    }
+};
+
+/// Result of page translation
+pub const PageTranslationResult = struct {
+    /// Physical address
+    physical_address: u32,
+    /// Whether the page is writable
+    writable: bool,
+    /// Whether the page is user-accessible
+    user_accessible: bool,
+};
+
+/// Page translation error
+pub const PageTranslationError = error{
+    /// Page directory entry not present
+    PageDirectoryNotPresent,
+    /// Page table entry not present
+    PageTableNotPresent,
+    /// Write to read-only page
+    WriteProtection,
+    /// User access to supervisor page
+    UserAccessViolation,
+};
+
 /// System Registers for protected mode
 pub const SystemRegisters = struct {
     /// Global Descriptor Table Register
@@ -394,4 +532,51 @@ test "system registers init" {
     const sys = SystemRegisters.init();
     try std.testing.expect(!sys.isProtectedMode());
     try std.testing.expect(!sys.isPagingEnabled());
+}
+
+test "page directory entry" {
+    // PDE: present, r/w, user, points to page table at 0x12345000
+    // Bits: P=1, R/W=1, U/S=1, PWT=0, PCD=0, A=0, D=0, PS=0, G=0, AVL=0, base=0x12345
+    const pde = PageDirectoryEntry.fromU32(0x12345007);
+    try std.testing.expect(pde.present);
+    try std.testing.expect(pde.rw);
+    try std.testing.expect(pde.us);
+    try std.testing.expect(!pde.ps);
+    try std.testing.expectEqual(@as(u32, 0x12345000), pde.getPageTableAddress());
+
+    // PDE with PSE (4MB page)
+    const pde_4mb = PageDirectoryEntry.fromU32(0x00400087); // PS=1, present, r/w
+    try std.testing.expect(pde_4mb.present);
+    try std.testing.expect(pde_4mb.rw);
+    try std.testing.expect(pde_4mb.ps);
+}
+
+test "page table entry" {
+    // PTE: present, r/w, user, page frame at 0xABCDE000
+    const pte = PageTableEntry.fromU32(0xABCDE007);
+    try std.testing.expect(pte.present);
+    try std.testing.expect(pte.rw);
+    try std.testing.expect(pte.us);
+    try std.testing.expectEqual(@as(u32, 0xABCDE000), pte.getPageFrameAddress());
+
+    // PTE: read-only, supervisor only
+    const pte_ro = PageTableEntry.fromU32(0x00001001);
+    try std.testing.expect(pte_ro.present);
+    try std.testing.expect(!pte_ro.rw);
+    try std.testing.expect(!pte_ro.us);
+}
+
+test "page fault error code" {
+    // Write to non-present page in user mode
+    var err = PageFaultErrorCode{};
+    err.present = false;
+    err.write = true;
+    err.user = true;
+    try std.testing.expectEqual(@as(u32, 0x06), err.toU32());
+
+    // Protection violation (present page, write, supervisor)
+    const err2 = PageFaultErrorCode.fromU32(0x03);
+    try std.testing.expect(err2.present);
+    try std.testing.expect(err2.write);
+    try std.testing.expect(!err2.user);
 }

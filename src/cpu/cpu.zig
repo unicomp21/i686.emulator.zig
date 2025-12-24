@@ -19,6 +19,11 @@ pub const GateDescriptor = protected_mode.GateDescriptor;
 pub const CR0 = protected_mode.CR0;
 pub const CR3 = protected_mode.CR3;
 pub const CR4 = protected_mode.CR4;
+pub const PageDirectoryEntry = protected_mode.PageDirectoryEntry;
+pub const PageTableEntry = protected_mode.PageTableEntry;
+pub const PageFaultErrorCode = protected_mode.PageFaultErrorCode;
+pub const PageTranslationResult = protected_mode.PageTranslationResult;
+pub const PageTranslationError = protected_mode.PageTranslationError;
 
 /// CPU execution mode
 pub const CpuMode = enum {
@@ -287,28 +292,154 @@ pub const Cpu = struct {
         self.system.cr0.pe = false;
     }
 
-    /// Get current code address
+    /// Translate linear address to physical address through paging
+    /// Returns the physical address or a page fault error
+    pub fn translateLinearToPhysical(self: *Self, linear_address: u32, is_write: bool, is_user: bool) !u32 {
+        // If paging is not enabled, linear = physical
+        if (!self.system.cr0.pg) {
+            return linear_address;
+        }
+
+        // Extract page directory index (bits 31:22), page table index (bits 21:12), offset (bits 11:0)
+        const pde_index = (linear_address >> 22) & 0x3FF;
+        const pte_index = (linear_address >> 12) & 0x3FF;
+        const offset = linear_address & 0xFFF;
+
+        // Get page directory base from CR3
+        const pdb = self.system.cr3.getPageDirectoryBase();
+
+        // Read page directory entry
+        const pde_addr = pdb + (pde_index * 4);
+        const pde_raw = try self.mem.readDword(pde_addr);
+        const pde = PageDirectoryEntry.fromU32(pde_raw);
+
+        // Check if PDE is present
+        if (!pde.present) {
+            // Page fault - page directory entry not present
+            self.system.cr2 = linear_address;
+            return CpuError.PageFault;
+        }
+
+        // Check for 4MB page (PSE)
+        if (pde.ps and self.system.cr4.pse) {
+            // 4MB page - use bits 31:22 from PDE, bits 21:0 from linear address
+            const physical_base = pde.get4MBPageAddress() & 0xFFC00000;
+            const page_offset = linear_address & 0x003FFFFF;
+
+            // Check permissions
+            if (is_write and !pde.rw) {
+                if (self.system.cr0.wp or is_user) {
+                    self.system.cr2 = linear_address;
+                    return CpuError.PageFault;
+                }
+            }
+            if (is_user and !pde.us) {
+                self.system.cr2 = linear_address;
+                return CpuError.PageFault;
+            }
+
+            // Set accessed bit (would normally be done by hardware)
+            // For now, we skip this to avoid complexity
+
+            return physical_base | page_offset;
+        }
+
+        // 4KB page - read page table entry
+        const pt_addr = pde.getPageTableAddress();
+        const pte_addr = pt_addr + (pte_index * 4);
+        const pte_raw = try self.mem.readDword(pte_addr);
+        const pte = PageTableEntry.fromU32(pte_raw);
+
+        // Check if PTE is present
+        if (!pte.present) {
+            // Page fault - page table entry not present
+            self.system.cr2 = linear_address;
+            return CpuError.PageFault;
+        }
+
+        // Check permissions (combine PDE and PTE)
+        // Write protection: if either PDE or PTE has R/W=0, page is read-only
+        const page_writable = pde.rw and pte.rw;
+        // User access: if either PDE or PTE has U/S=0, page is supervisor-only
+        const page_user = pde.us and pte.us;
+
+        if (is_write and !page_writable) {
+            // WP (Write Protect) in CR0 controls supervisor writes to read-only pages
+            if (self.system.cr0.wp or is_user) {
+                self.system.cr2 = linear_address;
+                return CpuError.PageFault;
+            }
+        }
+        if (is_user and !page_user) {
+            self.system.cr2 = linear_address;
+            return CpuError.PageFault;
+        }
+
+        // Calculate physical address
+        const physical_address = pte.getPageFrameAddress() | offset;
+        return physical_address;
+    }
+
+    /// Read byte from memory, going through paging if enabled
+    pub fn readMemByte(self: *Self, linear_address: u32) !u8 {
+        const physical = try self.translateLinearToPhysical(linear_address, false, false);
+        return self.mem.readByte(physical);
+    }
+
+    /// Read word from memory, going through paging if enabled
+    pub fn readMemWord(self: *Self, linear_address: u32) !u16 {
+        // For simplicity, assume no page boundary crossing
+        const physical = try self.translateLinearToPhysical(linear_address, false, false);
+        return self.mem.readWord(physical);
+    }
+
+    /// Read dword from memory, going through paging if enabled
+    pub fn readMemDword(self: *Self, linear_address: u32) !u32 {
+        // For simplicity, assume no page boundary crossing
+        const physical = try self.translateLinearToPhysical(linear_address, false, false);
+        return self.mem.readDword(physical);
+    }
+
+    /// Write byte to memory, going through paging if enabled
+    pub fn writeMemByte(self: *Self, linear_address: u32, value: u8) !void {
+        const physical = try self.translateLinearToPhysical(linear_address, true, false);
+        try self.mem.writeByte(physical, value);
+    }
+
+    /// Write word to memory, going through paging if enabled
+    pub fn writeMemWord(self: *Self, linear_address: u32, value: u16) !void {
+        const physical = try self.translateLinearToPhysical(linear_address, true, false);
+        try self.mem.writeWord(physical, value);
+    }
+
+    /// Write dword to memory, going through paging if enabled
+    pub fn writeMemDword(self: *Self, linear_address: u32, value: u32) !void {
+        const physical = try self.translateLinearToPhysical(linear_address, true, false);
+        try self.mem.writeDword(physical, value);
+    }
+
+    /// Get current code address (linear)
     fn getCodeAddress(self: *const Self) u32 {
         return self.getEffectiveAddress(self.segments.cs, self.eip);
     }
 
-    /// Fetch byte at EIP and advance
-    fn fetchByte(self: *Self) !u8 {
-        const addr = self.getCodeAddress();
-        const byte = try self.mem.readByte(addr);
+    /// Fetch byte at EIP and advance (goes through paging)
+    pub fn fetchByte(self: *Self) !u8 {
+        const linear_addr = self.getCodeAddress();
+        const byte = try self.readMemByte(linear_addr);
         self.eip +%= 1;
         return byte;
     }
 
-    /// Fetch word at EIP and advance
-    fn fetchWord(self: *Self) !u16 {
+    /// Fetch word at EIP and advance (goes through paging)
+    pub fn fetchWord(self: *Self) !u16 {
         const lo = try self.fetchByte();
         const hi = try self.fetchByte();
         return (@as(u16, hi) << 8) | lo;
     }
 
-    /// Fetch dword at EIP and advance
-    fn fetchDword(self: *Self) !u32 {
+    /// Fetch dword at EIP and advance (goes through paging)
+    pub fn fetchDword(self: *Self) !u32 {
         const lo = try self.fetchWord();
         const hi = try self.fetchWord();
         return (@as(u32, hi) << 16) | lo;
@@ -393,20 +524,20 @@ pub const Cpu = struct {
     pub fn push(self: *Self, value: u32) !void {
         self.regs.esp -%= 4;
         const addr = self.getEffectiveAddress(self.segments.ss, self.regs.esp);
-        try self.mem.writeDword(addr, value);
+        try self.writeMemDword(addr, value);
     }
 
     /// Push 16-bit value onto stack
     pub fn push16(self: *Self, value: u16) !void {
         self.regs.esp -%= 2;
         const addr = self.getEffectiveAddress(self.segments.ss, self.regs.esp);
-        try self.mem.writeWord(addr, value);
+        try self.writeMemWord(addr, value);
     }
 
     /// Pop value from stack
     pub fn pop(self: *Self) !u32 {
         const addr = self.getEffectiveAddress(self.segments.ss, self.regs.esp);
-        const value = try self.mem.readDword(addr);
+        const value = try self.readMemDword(addr);
         self.regs.esp +%= 4;
         return value;
     }
@@ -414,7 +545,7 @@ pub const Cpu = struct {
     /// Pop 16-bit value from stack
     pub fn pop16(self: *Self) !u16 {
         const addr = self.getEffectiveAddress(self.segments.ss, self.regs.esp);
-        const value = try self.mem.readWord(addr);
+        const value = try self.readMemWord(addr);
         self.regs.esp +%= 2;
         return value;
     }

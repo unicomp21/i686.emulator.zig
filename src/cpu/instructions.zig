@@ -93,6 +93,77 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             }
         },
 
+        // MOV AL, moffs8
+        0xA0 => {
+            const addr = try fetchDword(cpu);
+            const value = try cpu.readMemByte(addr);
+            cpu.regs.setReg8(0, value);
+        },
+
+        // MOV EAX, moffs32
+        0xA1 => {
+            const addr = try fetchDword(cpu);
+            if (cpu.prefix.operand_size_override) {
+                const value = try cpu.readMemWord(addr);
+                cpu.regs.setReg16(0, value);
+            } else {
+                const value = try cpu.readMemDword(addr);
+                cpu.regs.eax = value;
+            }
+        },
+
+        // MOV moffs8, AL
+        0xA2 => {
+            const addr = try fetchDword(cpu);
+            const value: u8 = @truncate(cpu.regs.eax);
+            try cpu.writeMemByte(addr, value);
+        },
+
+        // MOV moffs32, EAX
+        0xA3 => {
+            const addr = try fetchDword(cpu);
+            if (cpu.prefix.operand_size_override) {
+                try cpu.writeMemWord(addr, @truncate(cpu.regs.eax));
+            } else {
+                try cpu.writeMemDword(addr, cpu.regs.eax);
+            }
+        },
+
+        // MOV r/m8, imm8
+        0xC6 => {
+            const modrm = try fetchModRM(cpu);
+            // Calculate effective address first (may consume displacement bytes)
+            const addr = if (modrm.mod == 3) null else try calculateEffectiveAddress(cpu, modrm);
+            const imm = try fetchByte(cpu);
+            if (modrm.mod == 3) {
+                cpu.regs.setReg8(modrm.rm, imm);
+            } else {
+                try cpu.writeMemByte(addr.?, imm);
+            }
+        },
+
+        // MOV r/m32, imm32
+        0xC7 => {
+            const modrm = try fetchModRM(cpu);
+            // Calculate effective address first (may consume displacement bytes)
+            const addr = if (modrm.mod == 3) null else try calculateEffectiveAddress(cpu, modrm);
+            if (cpu.prefix.operand_size_override) {
+                const imm = try fetchWord(cpu);
+                if (modrm.mod == 3) {
+                    cpu.regs.setReg16(modrm.rm, imm);
+                } else {
+                    try cpu.writeMemWord(addr.?, imm);
+                }
+            } else {
+                const imm = try fetchDword(cpu);
+                if (modrm.mod == 3) {
+                    cpu.regs.setReg32(modrm.rm, imm);
+                } else {
+                    try cpu.writeMemDword(addr.?, imm);
+                }
+            }
+        },
+
         // PUSH r32 (50-57)
         0x50...0x57 => {
             const reg: u3 = @truncate(opcode & 0x7);
@@ -570,26 +641,26 @@ fn executeGroup7(cpu: *Cpu) !void {
         // SGDT - Store Global Descriptor Table Register
         0 => {
             const addr = try calculateEffectiveAddress(cpu, modrm);
-            try cpu.mem.writeWord(addr, cpu.system.gdtr.limit);
-            try cpu.mem.writeDword(addr + 2, cpu.system.gdtr.base);
+            try cpu.writeMemWord(addr, cpu.system.gdtr.limit);
+            try cpu.writeMemDword(addr + 2, cpu.system.gdtr.base);
         },
         // SIDT - Store Interrupt Descriptor Table Register
         1 => {
             const addr = try calculateEffectiveAddress(cpu, modrm);
-            try cpu.mem.writeWord(addr, cpu.system.idtr.limit);
-            try cpu.mem.writeDword(addr + 2, cpu.system.idtr.base);
+            try cpu.writeMemWord(addr, cpu.system.idtr.limit);
+            try cpu.writeMemDword(addr + 2, cpu.system.idtr.base);
         },
         // LGDT - Load Global Descriptor Table Register
         2 => {
             const addr = try calculateEffectiveAddress(cpu, modrm);
-            cpu.system.gdtr.limit = try cpu.mem.readWord(addr);
-            cpu.system.gdtr.base = try cpu.mem.readDword(addr + 2);
+            cpu.system.gdtr.limit = try cpu.readMemWord(addr);
+            cpu.system.gdtr.base = try cpu.readMemDword(addr + 2);
         },
         // LIDT - Load Interrupt Descriptor Table Register
         3 => {
             const addr = try calculateEffectiveAddress(cpu, modrm);
-            cpu.system.idtr.limit = try cpu.mem.readWord(addr);
-            cpu.system.idtr.base = try cpu.mem.readDword(addr + 2);
+            cpu.system.idtr.limit = try cpu.readMemWord(addr);
+            cpu.system.idtr.base = try cpu.readMemDword(addr + 2);
         },
         // SMSW - Store Machine Status Word
         4 => {
@@ -598,7 +669,7 @@ fn executeGroup7(cpu: *Cpu) !void {
                 cpu.regs.setReg16(modrm.rm, value);
             } else {
                 const addr = try calculateEffectiveAddress(cpu, modrm);
-                try cpu.mem.writeWord(addr, value);
+                try cpu.writeMemWord(addr, value);
             }
         },
         // LMSW - Load Machine Status Word
@@ -608,7 +679,7 @@ fn executeGroup7(cpu: *Cpu) !void {
                 value = cpu.regs.getReg16(modrm.rm);
             } else {
                 const addr = try calculateEffectiveAddress(cpu, modrm);
-                value = try cpu.mem.readWord(addr);
+                value = try cpu.readMemWord(addr);
             }
             // LMSW can only set PE, not clear it
             var cr0 = cpu.system.cr0;
@@ -709,23 +780,19 @@ fn executeGroup1(cpu: *Cpu, opcode: u8) !void {
 
 // Helper functions
 
+/// Fetch byte from instruction stream (uses paged memory)
 fn fetchByte(cpu: *Cpu) !u8 {
-    const addr = cpu.getEffectiveAddress(cpu.segments.cs, cpu.eip);
-    const byte = try cpu.mem.readByte(addr);
-    cpu.eip +%= 1;
-    return byte;
+    return cpu.fetchByte();
 }
 
+/// Fetch word from instruction stream (uses paged memory)
 fn fetchWord(cpu: *Cpu) !u16 {
-    const lo = try fetchByte(cpu);
-    const hi = try fetchByte(cpu);
-    return (@as(u16, hi) << 8) | lo;
+    return cpu.fetchWord();
 }
 
+/// Fetch dword from instruction stream (uses paged memory)
 fn fetchDword(cpu: *Cpu) !u32 {
-    const lo = try fetchWord(cpu);
-    const hi = try fetchWord(cpu);
-    return (@as(u32, hi) << 16) | lo;
+    return cpu.fetchDword();
 }
 
 fn fetchModRM(cpu: *Cpu) !ModRM {
@@ -738,7 +805,7 @@ fn readRM8(cpu: *Cpu, modrm: ModRM) !u8 {
         return cpu.regs.getReg8(modrm.rm);
     }
     const addr = try calculateEffectiveAddress(cpu, modrm);
-    return cpu.mem.readByte(addr);
+    return cpu.readMemByte(addr);
 }
 
 fn readRM16(cpu: *Cpu, modrm: ModRM) !u16 {
@@ -746,7 +813,7 @@ fn readRM16(cpu: *Cpu, modrm: ModRM) !u16 {
         return cpu.regs.getReg16(modrm.rm);
     }
     const addr = try calculateEffectiveAddress(cpu, modrm);
-    return cpu.mem.readWord(addr);
+    return cpu.readMemWord(addr);
 }
 
 fn readRM32(cpu: *Cpu, modrm: ModRM) !u32 {
@@ -754,7 +821,7 @@ fn readRM32(cpu: *Cpu, modrm: ModRM) !u32 {
         return cpu.regs.getReg32(modrm.rm);
     }
     const addr = try calculateEffectiveAddress(cpu, modrm);
-    return cpu.mem.readDword(addr);
+    return cpu.readMemDword(addr);
 }
 
 fn writeRM8(cpu: *Cpu, modrm: ModRM, value: u8) !void {
@@ -763,7 +830,7 @@ fn writeRM8(cpu: *Cpu, modrm: ModRM, value: u8) !void {
         return;
     }
     const addr = try calculateEffectiveAddress(cpu, modrm);
-    try cpu.mem.writeByte(addr, value);
+    try cpu.writeMemByte(addr, value);
 }
 
 fn writeRM16(cpu: *Cpu, modrm: ModRM, value: u16) !void {
@@ -772,7 +839,7 @@ fn writeRM16(cpu: *Cpu, modrm: ModRM, value: u16) !void {
         return;
     }
     const addr = try calculateEffectiveAddress(cpu, modrm);
-    try cpu.mem.writeWord(addr, value);
+    try cpu.writeMemWord(addr, value);
 }
 
 fn writeRM32(cpu: *Cpu, modrm: ModRM, value: u32) !void {
@@ -781,7 +848,7 @@ fn writeRM32(cpu: *Cpu, modrm: ModRM, value: u32) !void {
         return;
     }
     const addr = try calculateEffectiveAddress(cpu, modrm);
-    try cpu.mem.writeDword(addr, value);
+    try cpu.writeMemDword(addr, value);
 }
 
 fn calculateEffectiveAddress(cpu: *Cpu, modrm: ModRM) !u32 {
@@ -917,8 +984,8 @@ fn handleInterrupt(cpu: *Cpu, vector: u8) !void {
 
     // For now, just use a simple IVT lookup (real mode style)
     const ivt_addr = @as(u32, vector) * 4;
-    const new_ip = try cpu.mem.readWord(ivt_addr);
-    const new_cs = try cpu.mem.readWord(ivt_addr + 2);
+    const new_ip = try cpu.readMemWord(ivt_addr);
+    const new_cs = try cpu.readMemWord(ivt_addr + 2);
 
     cpu.segments.cs = new_cs;
     cpu.eip = new_ip;

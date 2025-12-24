@@ -95,7 +95,7 @@ docker run --rm i686-emu-test
 
 ### Test Status
 
-All tests currently pass (68/68):
+All tests currently pass (72/72):
 
 | Test Suite | Tests | Status |
 |------------|-------|--------|
@@ -107,8 +107,8 @@ All tests currently pass (68/68):
 | Event Queue | 4 | ✓ Pass |
 | CPU (via root) | 4 | ✓ Pass |
 | I/O (via root) | 2 | ✓ Pass |
-| Protected Mode | 5 | ✓ Pass |
-| Integration | 9 | ✓ Pass |
+| Protected Mode | 8 | ✓ Pass |
+| Integration | 10 | ✓ Pass |
 
 ### Test Categories
 
@@ -117,7 +117,7 @@ All tests currently pass (68/68):
 | CPU | `src/cpu/cpu.zig` | CPU initialization, reset, state |
 | Registers | `src/cpu/registers.zig` | 8/16/32-bit register access, flags |
 | Instructions | `src/cpu/instructions.zig` | Individual instruction execution |
-| Protected Mode | `src/cpu/protected_mode.zig` | GDT/IDT, CR0-CR4, segment descriptors |
+| Protected Mode | `src/cpu/protected_mode.zig` | GDT/IDT, CR0-CR4, segment descriptors, paging |
 | Memory | `src/memory/memory.zig` | Read/write, bounds checking |
 | I/O | `src/io/io.zig` | Port mapping, UART registration |
 | UART | `src/io/uart.zig` | Serial I/O, register access |
@@ -183,6 +183,7 @@ Current integration tests:
 - **protected mode**: LGDT + CR0.PE mode switch
 - **lidt**: Load Interrupt Descriptor Table
 - **mov cr0**: Control register read/write
+- **paging identity map**: Enable paging with identity-mapped page tables
 
 ## Key Modules
 
@@ -464,7 +465,7 @@ The long-term goal is running Linux kernel self-tests. Current progress:
 | UART I/O | ✓ Done | 16550A for test output |
 | Event system | ✓ Done | Async queue + epoll event loop |
 | Protected mode | ✓ Done | GDT/IDT, CR0-CR4, mode switching |
-| Paging | ☐ TODO | Required for Linux |
+| Paging | ✓ Done | 4KB pages, identity mapping, CR3/PG support |
 | System calls | ☐ TODO | INT 0x80 / SYSENTER |
 | Full instruction set | ☐ TODO | ~250 more opcodes |
 
@@ -489,32 +490,57 @@ const code = [_]u8{
 };
 ```
 
+### Paging Support
+
+The emulator now supports x86 paging with:
+
+- **Page Directory/Table Entries**: Full parsing of PDE and PTE structures
+- **CR3**: Page directory base register with proper bit field handling
+- **CR0.PG**: Enables/disables paging
+- **Address Translation**: Linear-to-physical address translation through page tables
+- **4KB Pages**: Standard 4KB page size with identity mapping support
+- **Page Fault (#PF)**: CR2 stores faulting address on page fault
+- **Permission Checking**: Present, R/W, and U/S bit checking
+
+Example paging setup:
+```zig
+// Enable paging after protected mode
+const code = [_]u8{
+    0xB8, 0x00, 0x20, 0x00, 0x00,             // mov eax, 0x2000 (page dir)
+    0x0F, 0x22, 0xD8,                         // mov cr3, eax
+    0x0F, 0x20, 0xC0,                         // mov eax, cr0
+    0x0D, 0x00, 0x00, 0x00, 0x80,             // or eax, 0x80000000 (PG bit)
+    0x0F, 0x22, 0xC0,                         // mov cr0, eax
+    // Paging is now active
+};
+```
+
+Page table structure (set up in physical memory before enabling):
+- Page Directory at CR3: 1024 4-byte entries (covers 4GB)
+- Each PDE points to a Page Table with 1024 4-byte entries
+- Each PTE points to a 4KB page frame
+
 ### Priority Features for kselftest
 
-1. **Paging**
-   - Page directory/table parsing
-   - CR3 page directory base
-   - Page fault (#PF) handling
-
-2. **More System Instructions**
+1. **More System Instructions**
    - SYSENTER/SYSEXIT
    - LLDT, LTR (task register)
    - IRET (interrupt return)
 
-3. **Memory Management**
-   - Paging support (CR0, CR3, page tables)
-   - Page fault handling (#PF)
-   - TLB emulation
-
-4. **Interrupts & Exceptions**
-   - IDT support
+2. **Interrupts & Exceptions**
+   - IDT-based interrupt dispatch
    - Hardware interrupt simulation
    - Exception handling (#GP, #PF, #UD, etc.)
 
-5. **Additional I/O**
+3. **Additional I/O**
    - PIC (8259) emulation
    - PIT (8254) timer emulation
    - Keyboard controller (8042)
+
+4. **More Instructions**
+   - LEA, MOVZX, MOVSX
+   - Shift/rotate (SHL, SHR, ROL, ROR)
+   - String operations (REP MOVS, STOS, etc.)
 
 ## Performance Considerations
 
