@@ -95,7 +95,7 @@ docker run --rm i686-emu-test
 
 ### Test Status
 
-All tests currently pass (72/72):
+All tests currently pass (77/77):
 
 | Test Suite | Tests | Status |
 |------------|-------|--------|
@@ -108,7 +108,7 @@ All tests currently pass (72/72):
 | CPU (via root) | 4 | ✓ Pass |
 | I/O (via root) | 2 | ✓ Pass |
 | Protected Mode | 8 | ✓ Pass |
-| Integration | 10 | ✓ Pass |
+| Integration | 15 | ✓ Pass |
 
 ### Test Categories
 
@@ -184,6 +184,11 @@ Current integration tests:
 - **lidt**: Load Interrupt Descriptor Table
 - **mov cr0**: Control register read/write
 - **paging identity map**: Enable paging with identity-mapped page tables
+- **lea**: LEA with SIB addressing modes
+- **movzx movsx**: Zero and sign extension instructions
+- **shifts**: SHL, SHR, SAR with immediate count
+- **test instruction**: TEST with flag verification
+- **mul div**: MUL and DIV arithmetic operations
 
 ## Key Modules
 
@@ -208,9 +213,10 @@ Core CPU emulation:
 ### Instructions (`src/cpu/instructions.zig`)
 
 Implemented instruction groups:
-- **Data Movement**: MOV, PUSH, POP
-- **Arithmetic**: ADD, SUB, INC, DEC, CMP
-- **Logic**: XOR, AND, OR
+- **Data Movement**: MOV, LEA, PUSH, POP, MOVZX, MOVSX
+- **Arithmetic**: ADD, SUB, INC, DEC, CMP, MUL, IMUL, DIV, IDIV, NEG
+- **Logic**: XOR, AND, OR, NOT, TEST
+- **Shift/Rotate**: SHL, SHR, SAR, ROL, ROR, RCL, RCR
 - **Control Flow**: JMP, Jcc, CALL, RET, INT
 - **I/O**: IN, OUT
 - **System**: NOP, HLT, CLI, STI, CLD, STD
@@ -461,13 +467,14 @@ The long-term goal is running Linux kernel self-tests. Current progress:
 | Component | Status | Notes |
 |-----------|--------|-------|
 | Real mode | ✓ Done | Segment * 16 + offset addressing |
-| Basic instructions | ✓ Done | MOV, PUSH/POP, ADD/SUB, JMP, CALL/RET, OR, AND, XOR |
+| Basic instructions | ✓ Done | MOV, LEA, PUSH/POP, ADD/SUB, JMP, CALL/RET, OR, AND, XOR |
+| Extended instructions | ✓ Done | MOVZX/MOVSX, shifts/rotates, TEST, MUL/DIV |
 | UART I/O | ✓ Done | 16550A for test output |
 | Event system | ✓ Done | Async queue + epoll event loop |
 | Protected mode | ✓ Done | GDT/IDT, CR0-CR4, mode switching |
 | Paging | ✓ Done | 4KB pages, identity mapping, CR3/PG support |
 | System calls | ☐ TODO | INT 0x80 / SYSENTER |
-| Full instruction set | ☐ TODO | ~250 more opcodes |
+| Full instruction set | ☐ TODO | ~200 more opcodes |
 
 ### Protected Mode Support
 
