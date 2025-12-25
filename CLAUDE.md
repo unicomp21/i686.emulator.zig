@@ -35,6 +35,8 @@ i686.emulator.zig/
 │   ├── io/
 │   │   ├── io.zig         # I/O controller
 │   │   └── uart.zig       # UART 16550A emulation
+│   ├── boot/
+│   │   └── loader.zig     # Linux kernel boot loader
 │   ├── async/
 │   │   ├── queue.zig      # Async event queue
 │   │   └── eventloop.zig  # epoll-based event loop
@@ -42,6 +44,7 @@ i686.emulator.zig/
 │       └── debugger.zig   # Debug interface
 └── tests/
     ├── integration_test.zig  # Integration tests with machine code
+    ├── boot_test.zig         # Kernel boot loader tests
     └── linux/
         ├── Makefile          # Linux kernel build infrastructure
         └── README.md         # kselftest roadmap and status
@@ -127,7 +130,9 @@ All tests currently pass (100+):
 | Event Queue | `src/async/queue.zig` | Event prioritization, handlers |
 | Event Loop | `src/async/eventloop.zig` | Timers, interrupts, epoll |
 | Debug | `src/debug/debugger.zig` | Breakpoints, tracing |
+| Boot Loader | `src/boot/loader.zig` | Kernel loading, boot protocol parsing |
 | Integration | `tests/integration_test.zig` | End-to-end with real machine code |
+| Boot Tests | `tests/boot_test.zig` | Kernel boot and setup verification |
 
 ### UART Testing Pattern
 
@@ -205,6 +210,7 @@ Main entry point for embedding. Provides:
 - `Emulator.step()` - Execute single instruction
 - `Emulator.run()` - Run until halt
 - `Emulator.loadBinary(data, address)` - Load code into memory
+- `Emulator.loadKernel(kernel_data, cmdline)` - Load Linux kernel for direct boot
 - `Emulator.getUartOutput()` - Get serial output
 - `Emulator.getCpuState()` - Get CPU state snapshot
 
@@ -266,6 +272,37 @@ Single-threaded event loop using epoll:
 - Interrupt source handling (256 vectors)
 - Cycle-accurate time tracking
 - Non-blocking I/O polling
+
+### Boot Loader (`src/boot/loader.zig`)
+
+Linux kernel direct boot implementation:
+- Parses bzImage boot protocol headers
+- Sets up boot parameters structure (zero page)
+- Loads kernel at 1MB physical address
+- Configures CPU for protected-mode entry
+- Supports command line and initrd
+
+Memory layout for kernel boot:
+```
+0x00000 - 0x00FFF: Real-mode IVT
+0x10000 - 0x1FFFF: Boot parameters (zero page)
+0x20000 - 0x2FFFF: Command line
+0x100000+        : Protected-mode kernel
+```
+
+Usage:
+```zig
+// Load and boot kernel
+try emu.loadKernel(kernel_data, "console=ttyS0 root=/dev/sda1");
+try emu.run(); // Begin kernel execution
+```
+
+The boot loader implements the Linux x86 boot protocol (version 2.00+):
+- `DirectBoot.init()` - Parse kernel from file path
+- `DirectBoot.initFromMemory()` - Parse kernel from memory
+- `DirectBoot.load()` - Load kernel into emulator
+- `setupCpuForBoot()` - Configure CPU state for entry
+- `setupMinimalGDT()` - Create flat GDT for protected mode
 
 ## Architecture
 

@@ -13,6 +13,7 @@ pub const uart = @import("io/uart.zig");
 pub const debug = @import("debug/debugger.zig");
 pub const async_queue = @import("async/queue.zig");
 pub const event_loop = @import("async/eventloop.zig");
+pub const boot = @import("boot/loader.zig");
 
 /// CPU type aliases for convenience
 pub const Cpu = cpu.Cpu;
@@ -167,6 +168,30 @@ pub const Emulator = struct {
     /// Get current CPU state for debugging
     pub fn getCpuState(self: *const Self) CpuState {
         return self.cpu_instance.getState();
+    }
+
+    /// Load Linux kernel for direct boot
+    /// Parses the kernel boot header, sets up boot parameters, and configures
+    /// the CPU to begin execution at the kernel entry point.
+    ///
+    /// Parameters:
+    ///   - kernel_data: Raw kernel image (bzImage format)
+    ///   - cmdline: Kernel command line string (e.g., "console=ttyS0 root=/dev/sda1")
+    ///
+    /// The kernel will be loaded according to the Linux boot protocol:
+    ///   - Boot parameters at 0x10000 (zero page)
+    ///   - Command line at 0x20000
+    ///   - Protected-mode kernel at 0x100000 (1 MB)
+    ///   - CPU configured in protected mode with flat segments
+    ///
+    /// After calling this, use run() or step() to begin kernel execution.
+    pub fn loadKernel(self: *Self, kernel_data: []const u8, cmdline: []const u8) !void {
+        self.fixPointers();
+
+        var direct_boot = try boot.DirectBoot.initFromMemory(self.allocator, kernel_data, cmdline);
+        defer direct_boot.deinit();
+
+        try direct_boot.load(self);
     }
 };
 

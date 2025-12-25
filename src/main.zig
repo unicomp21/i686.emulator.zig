@@ -8,57 +8,145 @@ const root = @import("root.zig");
 const Emulator = root.Emulator;
 const Config = root.Config;
 
+/// Command-line arguments
+const Args = struct {
+    binary_path: ?[]const u8 = null,
+    kernel_path: ?[]const u8 = null,
+    cmdline: []const u8 = "console=ttyS0 earlyprintk=serial",
+    initrd_path: ?[]const u8 = null,
+    memory_mb: u32 = 128,
+    debug: bool = false,
+};
+
+/// Parse command-line arguments
+fn parseArgs(allocator: std.mem.Allocator) !Args {
+    const process_args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, process_args);
+
+    var result = Args{};
+    var i: usize = 1;
+
+    while (i < process_args.len) : (i += 1) {
+        const arg = process_args[i];
+
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            printUsage();
+            std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--debug")) {
+            result.debug = true;
+        } else if (std.mem.eql(u8, arg, "--kernel")) {
+            i += 1;
+            if (i >= process_args.len) {
+                std.debug.print("Error: --kernel requires a path argument\n", .{});
+                std.process.exit(1);
+            }
+            result.kernel_path = process_args[i];
+        } else if (std.mem.eql(u8, arg, "--cmdline")) {
+            i += 1;
+            if (i >= process_args.len) {
+                std.debug.print("Error: --cmdline requires a string argument\n", .{});
+                std.process.exit(1);
+            }
+            result.cmdline = process_args[i];
+        } else if (std.mem.eql(u8, arg, "--initrd")) {
+            i += 1;
+            if (i >= process_args.len) {
+                std.debug.print("Error: --initrd requires a path argument\n", .{});
+                std.process.exit(1);
+            }
+            result.initrd_path = process_args[i];
+        } else if (std.mem.eql(u8, arg, "--memory")) {
+            i += 1;
+            if (i >= process_args.len) {
+                std.debug.print("Error: --memory requires a size in MB\n", .{});
+                std.process.exit(1);
+            }
+            result.memory_mb = try std.fmt.parseInt(u32, process_args[i], 10);
+        } else if (arg[0] == '-') {
+            std.debug.print("Error: unknown option '{s}'\n", .{arg});
+            std.debug.print("Use --help for usage information\n", .{});
+            std.process.exit(1);
+        } else {
+            // Positional argument - treat as binary path
+            if (result.binary_path != null) {
+                std.debug.print("Error: multiple binary paths specified\n", .{});
+                std.process.exit(1);
+            }
+            result.binary_path = arg;
+        }
+    }
+
+    return result;
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const parsed_args = try parseArgs(allocator);
 
-    var config = Config{};
-    var binary_path: ?[]const u8 = null;
-    var debug_mode = false;
-
-    // Parse command line arguments
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            printUsage();
-            return;
-        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--debug")) {
-            debug_mode = true;
-            config.debug_mode = true;
-        } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--memory")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("Error: --memory requires a value\n", .{});
-                return;
-            }
-            config.memory_size = try std.fmt.parseInt(usize, args[i], 10);
-        } else if (arg[0] != '-') {
-            binary_path = arg;
-        }
-    }
+    // Configure emulator
+    var config = Config{
+        .memory_size = parsed_args.memory_mb * 1024 * 1024,
+        .enable_uart = true,
+        .debug_mode = parsed_args.debug,
+    };
 
     // Initialize emulator
     var emu = try Emulator.init(allocator, config);
     defer emu.deinit();
 
-    // Load binary if specified
-    if (binary_path) |path| {
-        const file = try std.fs.cwd().openFile(path, .{});
+    // Determine boot mode and load code
+    if (parsed_args.kernel_path) |kernel_path| {
+        // Direct kernel boot mode
+        std.debug.print("Loading kernel: {s}\n", .{kernel_path});
+        std.debug.print("Kernel cmdline: {s}\n", .{parsed_args.cmdline});
+
+        const kernel_file = try std.fs.cwd().openFile(kernel_path, .{});
+        defer kernel_file.close();
+
+        const kernel_data = try kernel_file.readToEndAlloc(allocator, 16 * 1024 * 1024);
+        defer allocator.free(kernel_data);
+
+        // Load initrd if specified
+        var initrd_data: ?[]const u8 = null;
+        defer if (initrd_data) |data| allocator.free(data);
+
+        if (parsed_args.initrd_path) |initrd_path| {
+            std.debug.print("Loading initrd: {s}\n", .{initrd_path});
+            const initrd_file = try std.fs.cwd().openFile(initrd_path, .{});
+            defer initrd_file.close();
+            initrd_data = try initrd_file.readToEndAlloc(allocator, 16 * 1024 * 1024);
+        }
+
+        // TODO: Implement loadKernel() method in Emulator
+        // For now, show a message that this feature is not yet implemented
+        std.debug.print("\nDirect kernel boot is not yet implemented.\n", .{});
+        std.debug.print("The --kernel option is available but requires implementation of:\n", .{});
+        std.debug.print("  - Linux boot protocol (bzImage parsing)\n", .{});
+        std.debug.print("  - Real mode setup (boot params, e820 map)\n", .{});
+        std.debug.print("  - Protected mode kernel entry\n", .{});
+        std.debug.print("\nSee CLAUDE.md for roadmap details.\n", .{});
+        return;
+    } else if (parsed_args.binary_path) |binary_path| {
+        // Raw binary boot mode (existing behavior)
+        const file = try std.fs.cwd().openFile(binary_path, .{});
         defer file.close();
 
         const data = try file.readToEndAlloc(allocator, 16 * 1024 * 1024);
         defer allocator.free(data);
 
         try emu.loadBinary(data, 0);
-        std.debug.print("Loaded {d} bytes from {s}\n", .{ data.len, path });
+        std.debug.print("Loaded {d} bytes from {s}\n", .{ data.len, binary_path });
+    } else {
+        // No binary or kernel specified
+        printUsage();
+        return;
     }
 
-    if (debug_mode) {
+    // Run emulator
+    if (parsed_args.debug) {
         try runDebugMode(&emu, allocator);
     } else {
         try emu.run();
@@ -74,19 +162,25 @@ pub fn main() !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\i686 Emulator
+        \\i686 Emulator - Intel Pentium Pro/II/III CPU Emulator
         \\
-        \\Usage: i686-emu [options] [binary]
+        \\Usage:
+        \\  i686-emulator [options] [binary]
+        \\  i686-emulator --kernel <bzImage> [--cmdline "..."]
         \\
         \\Options:
-        \\  -h, --help      Show this help message
-        \\  -d, --debug     Enable debug/stepping mode
-        \\  -m, --memory N  Set memory size in bytes (default: 16MB)
+        \\  --kernel <path>    Linux kernel image (bzImage format)
+        \\  --cmdline <args>   Kernel command line (default: "console=ttyS0 earlyprintk=serial")
+        \\  --initrd <path>    Initial RAM disk image (optional)
+        \\  --memory <MB>      Memory size in megabytes (default: 128)
+        \\  -d, --debug        Enable debug/stepping mode
+        \\  -h, --help         Show this help message
         \\
         \\Examples:
-        \\  i686-emu program.bin           Run a binary
-        \\  i686-emu -d program.bin        Debug a binary
-        \\  i686-emu -m 1048576 prog.bin   Run with 1MB memory
+        \\  i686-emulator program.bin
+        \\  i686-emulator --kernel bzImage --cmdline "console=ttyS0"
+        \\  i686-emulator --kernel bzImage --initrd initrd.img --memory 256
+        \\  i686-emulator -d program.bin
         \\
     , .{});
 }

@@ -106,6 +106,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_queue_tests = b.addRunArtifact(queue_tests);
 
+    const boot_loader_tests = b.addTest(.{
+        .root_source_file = b.path("src/boot/loader.zig"),
+        .target = native_target,
+        .optimize = optimize,
+    });
+    const run_boot_loader_tests = b.addRunArtifact(boot_loader_tests);
+
+    const boot_linux_tests = b.addTest(.{
+        .root_source_file = b.path("src/boot/linux.zig"),
+        .target = native_target,
+        .optimize = optimize,
+    });
+    const run_boot_linux_tests = b.addRunArtifact(boot_linux_tests);
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
@@ -113,6 +127,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_memory_tests.step);
     test_step.dependOn(&run_uart_tests.step);
     test_step.dependOn(&run_queue_tests.step);
+    test_step.dependOn(&run_boot_loader_tests.step);
+    test_step.dependOn(&run_boot_linux_tests.step);
 
     // ============================================
     // Integration Tests
@@ -127,11 +143,21 @@ pub fn build(b: *std.Build) void {
     integration_tests.root_module.addImport("emulator", &lib.root_module);
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
+    // Boot loader integration tests
+    const boot_integration_tests = b.addTest(.{
+        .root_source_file = b.path("tests/boot_test.zig"),
+        .target = native_target,
+        .optimize = optimize,
+    });
+    const run_boot_integration_tests = b.addRunArtifact(boot_integration_tests);
+
     const integ_step = b.step("test-integ", "Run integration tests");
     integ_step.dependOn(&run_integration_tests.step);
+    integ_step.dependOn(&run_boot_integration_tests.step);
 
     // Add integration tests to main test step
     test_step.dependOn(&run_integration_tests.step);
+    test_step.dependOn(&run_boot_integration_tests.step);
 
     // ============================================
     // Documentation
