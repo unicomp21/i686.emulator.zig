@@ -73,6 +73,77 @@ pub const CpuError = error{
     IoError,
 };
 
+/// x86 Exception Vectors (Intel Vol 3, Section 6.3.1)
+pub const Exception = enum(u8) {
+    /// #DE - Divide Error
+    divide_error = 0,
+    /// #DB - Debug Exception
+    debug = 1,
+    /// NMI - Non-Maskable Interrupt
+    nmi = 2,
+    /// #BP - Breakpoint
+    breakpoint = 3,
+    /// #OF - Overflow
+    overflow = 4,
+    /// #BR - BOUND Range Exceeded
+    bound_range = 5,
+    /// #UD - Invalid Opcode
+    invalid_opcode = 6,
+    /// #NM - Device Not Available (No Math Coprocessor)
+    device_not_available = 7,
+    /// #DF - Double Fault (with error code)
+    double_fault = 8,
+    /// Coprocessor Segment Overrun (reserved)
+    coprocessor_segment_overrun = 9,
+    /// #TS - Invalid TSS (with error code)
+    invalid_tss = 10,
+    /// #NP - Segment Not Present (with error code)
+    segment_not_present = 11,
+    /// #SS - Stack-Segment Fault (with error code)
+    stack_fault = 12,
+    /// #GP - General Protection Fault (with error code)
+    general_protection = 13,
+    /// #PF - Page Fault (with error code)
+    page_fault = 14,
+    /// Reserved
+    reserved_15 = 15,
+    /// #MF - x87 FPU Floating-Point Error
+    x87_fpu_error = 16,
+    /// #AC - Alignment Check (with error code)
+    alignment_check = 17,
+    /// #MC - Machine Check
+    machine_check = 18,
+    /// #XM - SIMD Floating-Point Exception
+    simd_floating_point = 19,
+    /// #VE - Virtualization Exception
+    virtualization_exception = 20,
+    /// #CP - Control Protection Exception (with error code)
+    control_protection = 21,
+    // 22-31 reserved
+    // 32-255 user-defined (maskable interrupts)
+
+    /// Check if this exception pushes an error code
+    pub fn hasErrorCode(self: Exception) bool {
+        return switch (self) {
+            .double_fault,
+            .invalid_tss,
+            .segment_not_present,
+            .stack_fault,
+            .general_protection,
+            .page_fault,
+            .alignment_check,
+            .control_protection,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Get the exception vector number
+    pub fn vector(self: Exception) u8 {
+        return @intFromEnum(self);
+    }
+};
+
 /// Instruction history entry for debugging
 pub const InstrHistoryEntry = struct {
     eip: u32,
@@ -640,6 +711,95 @@ pub const Cpu = struct {
             self.flags.interrupt = false;
         }
     }
+
+    /// Raise an exception with optional error code
+    /// This properly handles exceptions according to x86 architecture:
+    /// - Sets CR2 for page faults
+    /// - Pushes error code for exceptions that require it
+    /// - Dispatches through IDT/IVT
+    pub fn raiseException(self: *Self, exception: Exception, error_code: ?u32) !void {
+        const vec = exception.vector();
+
+        // Special handling for page faults: set CR2 to faulting address
+        if (exception == .page_fault) {
+            // CR2 should already be set by the code that detected the page fault
+            // but we can set it here if error_code contains the faulting address
+            // For now, we rely on the caller to have set CR2
+        }
+
+        if (self.mode == .protected) {
+            // Protected mode: use IDT
+            const offset = @as(u32, vec) * 8;
+
+            // Check if exception descriptor is within IDT limit
+            if (offset + 7 > self.system.idtr.limit) {
+                // If we can't deliver the exception, it's a double fault
+                if (exception != .double_fault) {
+                    return self.raiseException(.double_fault, 0);
+                }
+                // Triple fault - halt the CPU
+                self.halted = true;
+                return CpuError.DoubleFault;
+            }
+
+            // Read 8-byte gate descriptor from IDT
+            var bytes: [8]u8 = undefined;
+            for (0..8) |i| {
+                bytes[i] = try self.mem.readByte(self.system.idtr.base + offset + @as(u32, @intCast(i)));
+            }
+
+            const gate = protected_mode.GateDescriptor.fromBytes(bytes);
+
+            // Check if gate is present
+            if (!gate.isPresent()) {
+                // Non-present exception handler causes double fault
+                if (exception != .double_fault) {
+                    return self.raiseException(.double_fault, 0);
+                }
+                // Triple fault
+                self.halted = true;
+                return CpuError.DoubleFault;
+            }
+
+            // Push EFLAGS, CS, EIP
+            try self.push(self.flags.toU32());
+            try self.push16(self.segments.cs);
+            try self.push(self.eip);
+
+            // Push error code if this exception has one
+            if (exception.hasErrorCode()) {
+                try self.push(error_code orelse 0);
+            }
+
+            // Load new CS:EIP from gate descriptor
+            self.segments.cs = gate.selector;
+            self.eip = gate.getOffset();
+
+            // Clear IF flag for interrupt gates (not for trap gates)
+            if (gate.isInterruptGate()) {
+                self.flags.interrupt = false;
+            }
+        } else {
+            // Real mode: use IVT at fixed location 0x00000000
+            const vector_addr = @as(u32, vec) * 4;
+
+            // Push flags, CS, IP
+            try self.push(self.flags.toU32());
+            try self.push16(self.segments.cs);
+            try self.push(@truncate(self.eip));
+
+            // In real mode, error codes are not pushed (they're a protected mode feature)
+            // Some BIOS implementations might expect error codes, but standard real mode doesn't use them
+
+            // Read new IP and CS from IVT
+            const new_ip = try self.mem.readWord(vector_addr);
+            const new_cs = try self.mem.readWord(vector_addr + 2);
+
+            self.eip = new_ip;
+            self.segments.cs = new_cs;
+            self.flags.interrupt = false;
+        }
+    }
 };
 
 // Tests
@@ -703,4 +863,162 @@ test "cpu state snapshot" {
     try std.testing.expectEqual(@as(u32, 0x12345678), state.eax);
     try std.testing.expectEqual(@as(u16, 0x0800), state.cs);
     try std.testing.expectEqual(@as(u32, 0x0200), state.eip);
+}
+
+test "exception vector constants" {
+    // Verify exception vectors match x86 specification
+    try std.testing.expectEqual(@as(u8, 0), Exception.divide_error.vector());
+    try std.testing.expectEqual(@as(u8, 6), Exception.invalid_opcode.vector());
+    try std.testing.expectEqual(@as(u8, 13), Exception.general_protection.vector());
+    try std.testing.expectEqual(@as(u8, 14), Exception.page_fault.vector());
+}
+
+test "exception error code flags" {
+    // Exceptions that should have error codes
+    try std.testing.expect(Exception.double_fault.hasErrorCode());
+    try std.testing.expect(Exception.invalid_tss.hasErrorCode());
+    try std.testing.expect(Exception.segment_not_present.hasErrorCode());
+    try std.testing.expect(Exception.stack_fault.hasErrorCode());
+    try std.testing.expect(Exception.general_protection.hasErrorCode());
+    try std.testing.expect(Exception.page_fault.hasErrorCode());
+    try std.testing.expect(Exception.alignment_check.hasErrorCode());
+
+    // Exceptions that should NOT have error codes
+    try std.testing.expect(!Exception.divide_error.hasErrorCode());
+    try std.testing.expect(!Exception.debug.hasErrorCode());
+    try std.testing.expect(!Exception.breakpoint.hasErrorCode());
+    try std.testing.expect(!Exception.overflow.hasErrorCode());
+    try std.testing.expect(!Exception.bound_range.hasErrorCode());
+    try std.testing.expect(!Exception.invalid_opcode.hasErrorCode());
+    try std.testing.expect(!Exception.device_not_available.hasErrorCode());
+}
+
+test "raise exception in real mode" {
+    const allocator = std.testing.allocator;
+    var mem = try memory.Memory.init(allocator, 64 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = Cpu.init(&mem, &io_ctrl);
+    cpu.reset(0x0000, 0x1000);
+    cpu.regs.esp = 0x1000;
+
+    // Set up IVT entry for #UD (vector 6)
+    // IVT is at 0x00000000, each entry is 4 bytes (offset:segment)
+    try mem.writeWord(6 * 4, 0x2000); // IP
+    try mem.writeWord(6 * 4 + 2, 0x0000); // CS
+
+    const original_eip = cpu.eip;
+    const original_cs = cpu.segments.cs;
+    const original_flags = cpu.flags.toU32();
+
+    // Raise #UD exception
+    try cpu.raiseException(.invalid_opcode, null);
+
+    // Check that exception was dispatched
+    try std.testing.expectEqual(@as(u32, 0x2000), cpu.eip);
+    try std.testing.expectEqual(@as(u16, 0x0000), cpu.segments.cs);
+
+    // Check that flags, CS, and IP were pushed onto stack
+    const pushed_ip = try mem.readWord(cpu.getEffectiveAddress(cpu.segments.ss, cpu.regs.esp));
+    const pushed_cs = try mem.readWord(cpu.getEffectiveAddress(cpu.segments.ss, cpu.regs.esp + 2));
+    const pushed_flags = try mem.readDword(cpu.getEffectiveAddress(cpu.segments.ss, cpu.regs.esp + 4));
+
+    try std.testing.expectEqual(@as(u16, @truncate(original_eip)), pushed_ip);
+    try std.testing.expectEqual(original_cs, pushed_cs);
+    try std.testing.expectEqual(original_flags, pushed_flags);
+}
+
+test "raise exception in protected mode with error code" {
+    const allocator = std.testing.allocator;
+    var mem = try memory.Memory.init(allocator, 64 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = Cpu.init(&mem, &io_ctrl);
+    cpu.mode = .protected;
+    cpu.system.cr0.pe = true;
+    cpu.regs.esp = 0x1000;
+    cpu.eip = 0x500;
+    cpu.segments.cs = 0x08;
+
+    // Set up IDT entry for #GP (vector 13)
+    // IDT base at 0x2000
+    cpu.system.idtr.base = 0x2000;
+    cpu.system.idtr.limit = 0xFF;
+
+    // Create interrupt gate descriptor for #GP
+    // Offset = 0x00001000, Selector = 0x0008, DPL = 0, Present = 1, Type = 0xE (interrupt gate)
+    const gate_offset = @as(u32, 13) * 8;
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 0, 0x00); // Offset low byte
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 1, 0x10); // Offset byte 2
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 2, 0x08); // Selector low
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 3, 0x00); // Selector high
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 4, 0x00); // Reserved
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 5, 0x8E); // P=1, DPL=0, Type=0xE
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 6, 0x00); // Offset byte 3
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 7, 0x00); // Offset high byte
+
+    const original_eip = cpu.eip;
+    const original_cs = cpu.segments.cs;
+    const original_flags = cpu.flags.toU32();
+    const error_code: u32 = 0x1234;
+
+    // Raise #GP with error code
+    try cpu.raiseException(.general_protection, error_code);
+
+    // Check that exception was dispatched
+    try std.testing.expectEqual(@as(u32, 0x1000), cpu.eip);
+    try std.testing.expectEqual(@as(u16, 0x0008), cpu.segments.cs);
+
+    // Check that error code, EIP, CS, and EFLAGS were pushed
+    const pushed_error_code = try mem.readDword(cpu.regs.esp);
+    const pushed_eip = try mem.readDword(cpu.regs.esp + 4);
+    const pushed_cs = try mem.readWord(cpu.regs.esp + 8);
+    const pushed_flags = try mem.readDword(cpu.regs.esp + 10);
+
+    try std.testing.expectEqual(error_code, pushed_error_code);
+    try std.testing.expectEqual(original_eip, pushed_eip);
+    try std.testing.expectEqual(original_cs, pushed_cs);
+    try std.testing.expectEqual(original_flags, pushed_flags);
+}
+
+test "raise exception without error code in protected mode" {
+    const allocator = std.testing.allocator;
+    var mem = try memory.Memory.init(allocator, 64 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = Cpu.init(&mem, &io_ctrl);
+    cpu.mode = .protected;
+    cpu.system.cr0.pe = true;
+    cpu.regs.esp = 0x1000;
+    cpu.eip = 0x500;
+    cpu.segments.cs = 0x08;
+
+    // Set up IDT entry for #UD (vector 6) - no error code
+    cpu.system.idtr.base = 0x2000;
+    cpu.system.idtr.limit = 0xFF;
+
+    const gate_offset = @as(u32, 6) * 8;
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 0, 0x00);
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 1, 0x10);
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 2, 0x08);
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 3, 0x00);
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 4, 0x00);
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 5, 0x8E);
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 6, 0x00);
+    try mem.writeByte(cpu.system.idtr.base + gate_offset + 7, 0x00);
+
+    const original_esp = cpu.regs.esp;
+
+    // Raise #UD (no error code)
+    try cpu.raiseException(.invalid_opcode, null);
+
+    // Stack should have EFLAGS(4) + CS(2) + EIP(4) = 10 bytes pushed
+    // No error code for #UD
+    try std.testing.expectEqual(original_esp - 10, cpu.regs.esp);
 }

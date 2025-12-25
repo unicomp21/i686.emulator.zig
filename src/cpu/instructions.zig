@@ -7,6 +7,7 @@ const std = @import("std");
 const cpu_mod = @import("cpu.zig");
 const Cpu = cpu_mod.Cpu;
 const CpuError = cpu_mod.CpuError;
+const Exception = cpu_mod.Exception;
 const Flags = cpu_mod.Flags;
 
 /// ModR/M byte decoding result
@@ -1978,8 +1979,8 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
 
         // UD2 - Undefined Instruction (intentionally raises #UD)
         0x0B => {
-            // Raise Invalid Opcode exception
-            return CpuError.InvalidOpcode;
+            // Raise Invalid Opcode exception (#UD, vector 6)
+            try cpu.raiseException(.invalid_opcode, null);
         },
 
 

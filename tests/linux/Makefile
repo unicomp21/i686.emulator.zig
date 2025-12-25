@@ -26,7 +26,7 @@ CROSS_COMPILE ?=
 BUILD_DIR = build
 KSELFTEST_DIR = $(BUILD_DIR)/kselftest
 
-.PHONY: all download config kernel kselftest clean help
+.PHONY: all download config kernel kselftest clean help test-boot
 
 all: kernel
 
@@ -34,14 +34,16 @@ help:
 	@echo "Linux Kernel Build for i686 Emulator"
 	@echo ""
 	@echo "Targets:"
-	@echo "  download  - Download Linux $(LINUX_VERSION) source"
-	@echo "  config    - Configure kernel for i686 emulator"
-	@echo "  kernel    - Build the kernel (bzImage)"
-	@echo "  kselftest - Build kernel self-tests"
-	@echo "  clean     - Remove build artifacts"
+	@echo "  download    - Download Linux $(LINUX_VERSION) source"
+	@echo "  config      - Configure kernel for i686 emulator"
+	@echo "  kernel      - Build the kernel (bzImage)"
+	@echo "  kselftest   - Build kernel self-tests"
+	@echo "  test-boot   - Build and run boot sector test"
+	@echo "  test-kernel - Run full kernel (when ready)"
+	@echo "  clean       - Remove build artifacts"
 	@echo ""
-	@echo "The emulator currently supports real mode only."
-	@echo "Protected mode and paging are required to boot Linux."
+	@echo "The emulator now supports protected mode and paging!"
+	@echo "Working on boot sector tests before full kernel boot."
 
 download: $(LINUX_DIR)
 
@@ -77,7 +79,25 @@ clean:
 	rm -rf $(BUILD_DIR)
 	rm -rf $(LINUX_DIR)
 
-# Quick test target for emulator development
-test-boot: $(BUILD_DIR)/bzImage
-	@echo "To test boot (when emulator supports protected mode):"
-	@echo "  zig build run -- $(BUILD_DIR)/bzImage"
+# Boot sector test for emulator development
+$(BUILD_DIR)/test_boot.bin: test_boot.asm
+	@echo "Building boot sector test..."
+	@mkdir -p $(BUILD_DIR)
+	@if command -v nasm >/dev/null 2>&1; then \
+		nasm -f bin -o $(BUILD_DIR)/test_boot.bin test_boot.asm; \
+		echo "Boot sector built: $(BUILD_DIR)/test_boot.bin"; \
+	else \
+		echo "NASM not found. Install with: apt-get install nasm"; \
+		echo "Or use the pre-assembled binary if available."; \
+		exit 1; \
+	fi
+
+test-boot: $(BUILD_DIR)/test_boot.bin
+	@echo "Running boot sector test on emulator..."
+	cd ../.. && zig build run -- tests/linux/$(BUILD_DIR)/test_boot.bin
+
+# Full kernel boot (when ready)
+test-kernel: $(BUILD_DIR)/bzImage
+	@echo "Running Linux kernel on emulator..."
+	@echo "Note: This requires full boot protocol support."
+	cd ../.. && zig build run -- tests/linux/$(BUILD_DIR)/bzImage

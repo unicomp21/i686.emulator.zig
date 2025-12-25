@@ -11,3 +11,8 @@ zig-out/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Linux test artifacts
+tests/linux/build/
+tests/linux/linux-*/
+tests/linux/*.tar.xz
