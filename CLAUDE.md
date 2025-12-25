@@ -219,18 +219,22 @@ Core CPU emulation:
 ### Instructions (`src/cpu/instructions.zig`)
 
 Implemented instruction groups:
-- **Data Movement**: MOV, LEA, PUSH, POP, MOVZX, MOVSX, XCHG, LAHF, SAHF
-- **Segment Loading**: LES, LDS, LSS, LFS, LGS (load far pointers with segment:offset)
-- **Arithmetic**: ADD, SUB, INC, DEC, CMP, MUL, IMUL (1/2/3-operand forms), DIV, IDIV, NEG, CBW/CWDE, CWD/CDQ
+- **Data Movement**: MOV, LEA, PUSH, POP, MOVZX, MOVSX, XCHG, LAHF, SAHF, XLAT, CMOVcc
+- **Segment Operations**: MOV Sreg, LES, LDS, LSS, LFS, LGS, ARPL
+- **Arithmetic**: ADD, ADC, SUB, SBB, INC, DEC, CMP, MUL, IMUL (1/2/3-op), DIV, IDIV, NEG, CBW/CWDE, CWD/CDQ
+- **BCD Arithmetic**: DAA, DAS, AAA, AAS, AAM, AAD
 - **Logic**: XOR, AND, OR, NOT, TEST
 - **Shift/Rotate**: SHL, SHR, SAR, ROL, ROR, RCL, RCR, SHLD, SHRD
-- **Bit Manipulation**: BT, BTS, BTR, BTC, BSF, BSR, SETcc
-- **String Operations**: MOVS, STOS, LODS, CMPS, SCAS (with REP/REPNE prefixes)
-- **Control Flow**: JMP, Jcc, JECXZ/JCXZ, LOOP/LOOPE/LOOPNE, CALL, RET, INT, LEAVE, FAR JMP, FAR CALL, RETF
-- **Stack/Flags**: PUSHF, POPF, PUSHA, POPA
-- **I/O**: IN, OUT
-- **System**: NOP, HLT, CLI, STI, CLD, STD, CLTS, SLDT, STR, LLDT, LTR, VERR, VERW
-- **Special**: CPUID, RDTSC
+- **Bit Manipulation**: BT, BTS, BTR, BTC, BSF, BSR, SETcc, BSWAP
+- **String Operations**: MOVS, STOS, LODS, CMPS, SCAS, INS, OUTS (with REP/REPNE)
+- **Control Flow**: JMP, Jcc, JECXZ, LOOP/LOOPE/LOOPNE, CALL, RET, INT, INTO, IRET, LEAVE, FAR JMP/CALL, RETF
+- **Stack/Flags**: PUSHF, POPF, PUSHA, POPA, CLC, STC, CMC
+- **I/O**: IN, OUT, INS, OUTS (byte/word/dword)
+- **Atomic**: CMPXCHG, CMPXCHG8B, XADD
+- **System**: NOP, HLT, CLI, STI, CLD, STD, CLTS, WAIT, BOUND, UD2, INVLPG, WBINVD
+- **Descriptors**: LGDT, LIDT, SGDT, SIDT, SLDT, STR, LLDT, LTR, LAR, LSL, VERR, VERW, LMSW, SMSW
+- **Registers**: MOV CRn, MOV DRn, RDMSR, WRMSR, SYSENTER, SYSEXIT
+- **Special**: CPUID, RDTSC, INT3, INT1, SALC
 
 ### Memory (`src/memory/memory.zig`)
 
@@ -477,21 +481,26 @@ The long-term goal is running Linux kernel self-tests. Current progress:
 | Component | Status | Notes |
 |-----------|--------|-------|
 | Real mode | ✓ Done | Segment * 16 + offset addressing |
-| Basic instructions | ✓ Done | MOV, LEA, PUSH/POP, ADD/SUB, JMP, CALL/RET, OR, AND, XOR |
-| Extended instructions | ✓ Done | MOVZX/MOVSX, shifts/rotates, TEST, MUL/DIV, bit ops |
-| String operations | ✓ Done | REP MOVS/STOS/LODS/CMPS/SCAS with prefixes |
-| Stack frames | ✓ Done | ENTER/LEAVE with nesting levels |
-| UART I/O | ✓ Done | 16550A for test output |
-| Keyboard I/O | ✓ Done | 8042 controller, A20 gate, scan codes |
-| PIC/PIT | ✓ Done | 8259 interrupt controller, 8254 timer |
-| Event system | ✓ Done | Async queue + epoll event loop |
 | Protected mode | ✓ Done | GDT/IDT, CR0-CR4, mode switching |
 | Paging | ✓ Done | 4KB pages, identity mapping, CR3/PG support |
-| System calls | ✓ Done | INT 0x80 with IRET, SYSENTER/SYSEXIT |
-| MSR support | ✓ Done | RDMSR/WRMSR for SYSENTER registers |
-| Segment loading | ✓ Done | LES, LDS, LSS, LFS, LGS far pointers |
-| Descriptor table | ✓ Done | SLDT, STR, LLDT, LTR, VERR, VERW |
-| Full instruction set | ☐ TODO | ~150 more opcodes |
+| Core instructions | ✓ Done | MOV, LEA, PUSH/POP, arithmetic, logic, jumps |
+| Extended instructions | ✓ Done | MOVZX/MOVSX, CMOVcc, SETcc, bit ops |
+| String operations | ✓ Done | REP MOVS/STOS/LODS/CMPS/SCAS/INS/OUTS |
+| BCD arithmetic | ✓ Done | DAA, DAS, AAA, AAS, AAM, AAD |
+| Atomic operations | ✓ Done | CMPXCHG, CMPXCHG8B, XADD |
+| Stack frames | ✓ Done | ENTER/LEAVE, PUSHA/POPA |
+| Far control flow | ✓ Done | FAR JMP, FAR CALL, RETF |
+| System calls | ✓ Done | INT, IRET, SYSENTER/SYSEXIT |
+| Segment operations | ✓ Done | MOV Sreg, LxS, ARPL, LAR, LSL |
+| Descriptor tables | ✓ Done | LGDT/LIDT/SGDT/SIDT, LLDT/LTR, VERR/VERW |
+| Control/Debug regs | ✓ Done | MOV CRn, MOV DRn, LMSW/SMSW |
+| MSR support | ✓ Done | RDMSR/WRMSR, CPUID, RDTSC |
+| UART I/O | ✓ Done | 16550A for test output |
+| Keyboard I/O | ✓ Done | 8042 controller, A20 gate |
+| PIC/PIT | ✓ Done | 8259 interrupt controller, 8254 timer |
+| Event system | ✓ Done | Async queue + epoll event loop |
+| FPU stubs | ✓ Done | WAIT, ESC opcodes (no full FPU) |
+| Linux boot | ☐ TODO | Test with actual kernel image |
 
 ### Protected Mode Support
 
