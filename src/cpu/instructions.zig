@@ -107,6 +107,13 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             }
         },
 
+        // WAIT/FWAIT - Wait for FPU
+        0x9B => {
+            // Check for pending unmasked FPU exceptions
+            // For our emulator without FPU, this is a no-op
+            // But it's important for Linux compatibility
+        },
+
         // PUSHF/PUSHFD - Push flags
         0x9C => {
             if (cpu.prefix.operand_size_override) {
@@ -154,8 +161,29 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             cpu.regs.setReg8(4, ah); // AH
         },
 
+        // INT1/ICEBP - Ice Breakpoint
+        0xF1 => {
+            // Raise #DB (debug exception, vector 1)
+            try handleInterrupt(cpu, 1);
+        },
+
         // HLT
         0xF4 => cpu.halt(),
+
+        // CMC - Complement Carry Flag
+        0xF5 => {
+            cpu.flags.carry = !cpu.flags.carry;
+        },
+
+        // CLC - Clear Carry Flag
+        0xF8 => {
+            cpu.flags.carry = false;
+        },
+
+        // STC - Set Carry Flag
+        0xF9 => {
+            cpu.flags.carry = true;
+        },
 
         // MOV r8, imm8 (B0-B7)
         0xB0...0xB7 => {
@@ -385,6 +413,65 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             }
         },
 
+
+        // BOUND r16/32, m16&16/m32&32 - Check Array Index Against Bounds
+        0x62 => {
+            const modrm = try fetchModRM(cpu);
+            if (modrm.mod == 3) {
+                // BOUND requires a memory operand
+                return CpuError.InvalidOpcode;
+            }
+            const addr = try calculateEffectiveAddress(cpu, modrm);
+
+            if (cpu.prefix.operand_size_override) {
+                // 16-bit: Check if r16 is within bounds [lower:upper] in memory
+                const index: i16 = @bitCast(cpu.regs.getReg16(modrm.reg));
+                const lower: i16 = @bitCast(try cpu.readMemWord(addr));
+                const upper: i16 = @bitCast(try cpu.readMemWord(addr + 2));
+
+                // Raise #BR if index < lower or index > upper (for word/dword, it's upper + operand_size - 1)
+                if (index < lower or index > upper) {
+                    // In a real CPU, this would raise interrupt #BR (vector 5)
+                    // For now, we return an error
+                    return CpuError.GeneralProtectionFault;
+                }
+            } else {
+                // 32-bit: Check if r32 is within bounds [lower:upper] in memory
+                const index: i32 = @bitCast(cpu.regs.getReg32(modrm.reg));
+                const lower: i32 = @bitCast(try cpu.readMemDword(addr));
+                const upper: i32 = @bitCast(try cpu.readMemDword(addr + 4));
+
+                if (index < lower or index > upper) {
+                    return CpuError.GeneralProtectionFault;
+                }
+            }
+        },
+
+        // ARPL r/m16, r16 - Adjust RPL Field of Segment Selector
+        0x63 => {
+            // ARPL is only valid in protected mode
+            if (cpu.mode != .protected) {
+                return CpuError.InvalidOpcode;
+            }
+
+            const modrm = try fetchModRM(cpu);
+            // Always 16-bit operands, ignore operand size prefix
+            const dest_selector = try readRM16(cpu, modrm);
+            const src_selector = cpu.regs.getReg16(modrm.reg);
+
+            // Extract RPL (bits 0-1) from both selectors
+            const dest_rpl = dest_selector & 0x3;
+            const src_rpl = src_selector & 0x3;
+
+            if (dest_rpl < src_rpl) {
+                // Adjust dest RPL to match src RPL
+                const new_selector = (dest_selector & 0xFFFC) | src_rpl;
+                try writeRM16(cpu, modrm, new_selector);
+                cpu.flags.zero = true;
+            } else {
+                cpu.flags.zero = false;
+            }
+        },
         // IMUL r16/32, r/m16/32, imm16/32 - Three-operand signed multiply
         0x69 => {
             const modrm = try fetchModRM(cpu);
@@ -448,6 +535,34 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
                 cpu.flags.overflow = overflow;
 
                 cpu.regs.setReg32(modrm.reg, @bitCast(truncated));
+            }
+        },
+
+        // INSB - Input byte from port DX to ES:[EDI]
+        0x6C => {
+            try execIns(cpu, 1);
+        },
+
+        // INSW/INSD - Input word/dword from port DX to ES:[EDI]
+        0x6D => {
+            if (cpu.prefix.operand_size_override) {
+                try execIns(cpu, 2);
+            } else {
+                try execIns(cpu, 4);
+            }
+        },
+
+        // OUTSB - Output byte from DS:[ESI] to port DX
+        0x6E => {
+            try execOuts(cpu, 1);
+        },
+
+        // OUTSW/OUTSD - Output word/dword from DS:[ESI] to port DX
+        0x6F => {
+            if (cpu.prefix.operand_size_override) {
+                try execOuts(cpu, 2);
+            } else {
+                try execOuts(cpu, 4);
             }
         },
 
@@ -522,6 +637,146 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             }
         },
 
+        // ADC r/m8, r8
+        0x10 => {
+            const modrm = try fetchModRM(cpu);
+            const dst = try readRM8(cpu, modrm);
+            const src = cpu.regs.getReg8(modrm.reg);
+            const result = adcWithFlags8(cpu, dst, src);
+            try writeRM8(cpu, modrm, result);
+        },
+
+        // ADC r/m16/32, r16/32
+        0x11 => {
+            const modrm = try fetchModRM(cpu);
+            if (cpu.prefix.operand_size_override) {
+                const dst = try readRM16(cpu, modrm);
+                const src = cpu.regs.getReg16(modrm.reg);
+                const result = adcWithFlags16(cpu, dst, src);
+                try writeRM16(cpu, modrm, result);
+            } else {
+                const dst = try readRM32(cpu, modrm);
+                const src = cpu.regs.getReg32(modrm.reg);
+                const result = adcWithFlags32(cpu, dst, src);
+                try writeRM32(cpu, modrm, result);
+            }
+        },
+
+        // ADC r8, r/m8
+        0x12 => {
+            const modrm = try fetchModRM(cpu);
+            const dst = cpu.regs.getReg8(modrm.reg);
+            const src = try readRM8(cpu, modrm);
+            const result = adcWithFlags8(cpu, dst, src);
+            cpu.regs.setReg8(modrm.reg, result);
+        },
+
+        // ADC r16/32, r/m16/32
+        0x13 => {
+            const modrm = try fetchModRM(cpu);
+            if (cpu.prefix.operand_size_override) {
+                const dst = cpu.regs.getReg16(modrm.reg);
+                const src = try readRM16(cpu, modrm);
+                const result = adcWithFlags16(cpu, dst, src);
+                cpu.regs.setReg16(modrm.reg, result);
+            } else {
+                const dst = cpu.regs.getReg32(modrm.reg);
+                const src = try readRM32(cpu, modrm);
+                const result = adcWithFlags32(cpu, dst, src);
+                cpu.regs.setReg32(modrm.reg, result);
+            }
+        },
+
+        // ADC AL, imm8
+        0x14 => {
+            const imm = try fetchByte(cpu);
+            const result = adcWithFlags8(cpu, @truncate(cpu.regs.eax), imm);
+            cpu.regs.setReg8(0, result);
+        },
+
+        // ADC EAX, imm16/32
+        0x15 => {
+            if (cpu.prefix.operand_size_override) {
+                const imm = try fetchWord(cpu);
+                const result = adcWithFlags16(cpu, @truncate(cpu.regs.eax), imm);
+                cpu.regs.setReg16(0, result);
+            } else {
+                const imm = try fetchDword(cpu);
+                const result = adcWithFlags32(cpu, cpu.regs.eax, imm);
+                cpu.regs.eax = result;
+            }
+        },
+
+        // SBB r/m8, r8
+        0x18 => {
+            const modrm = try fetchModRM(cpu);
+            const dst = try readRM8(cpu, modrm);
+            const src = cpu.regs.getReg8(modrm.reg);
+            const result = sbbWithFlags8(cpu, dst, src);
+            try writeRM8(cpu, modrm, result);
+        },
+
+        // SBB r/m16/32, r16/32
+        0x19 => {
+            const modrm = try fetchModRM(cpu);
+            if (cpu.prefix.operand_size_override) {
+                const dst = try readRM16(cpu, modrm);
+                const src = cpu.regs.getReg16(modrm.reg);
+                const result = sbbWithFlags16(cpu, dst, src);
+                try writeRM16(cpu, modrm, result);
+            } else {
+                const dst = try readRM32(cpu, modrm);
+                const src = cpu.regs.getReg32(modrm.reg);
+                const result = sbbWithFlags32(cpu, dst, src);
+                try writeRM32(cpu, modrm, result);
+            }
+        },
+
+        // SBB r8, r/m8
+        0x1A => {
+            const modrm = try fetchModRM(cpu);
+            const dst = cpu.regs.getReg8(modrm.reg);
+            const src = try readRM8(cpu, modrm);
+            const result = sbbWithFlags8(cpu, dst, src);
+            cpu.regs.setReg8(modrm.reg, result);
+        },
+
+        // SBB r16/32, r/m16/32
+        0x1B => {
+            const modrm = try fetchModRM(cpu);
+            if (cpu.prefix.operand_size_override) {
+                const dst = cpu.regs.getReg16(modrm.reg);
+                const src = try readRM16(cpu, modrm);
+                const result = sbbWithFlags16(cpu, dst, src);
+                cpu.regs.setReg16(modrm.reg, result);
+            } else {
+                const dst = cpu.regs.getReg32(modrm.reg);
+                const src = try readRM32(cpu, modrm);
+                const result = sbbWithFlags32(cpu, dst, src);
+                cpu.regs.setReg32(modrm.reg, result);
+            }
+        },
+
+        // SBB AL, imm8
+        0x1C => {
+            const imm = try fetchByte(cpu);
+            const result = sbbWithFlags8(cpu, @truncate(cpu.regs.eax), imm);
+            cpu.regs.setReg8(0, result);
+        },
+
+        // SBB EAX, imm16/32
+        0x1D => {
+            if (cpu.prefix.operand_size_override) {
+                const imm = try fetchWord(cpu);
+                const result = sbbWithFlags16(cpu, @truncate(cpu.regs.eax), imm);
+                cpu.regs.setReg16(0, result);
+            } else {
+                const imm = try fetchDword(cpu);
+                const result = sbbWithFlags32(cpu, cpu.regs.eax, imm);
+                cpu.regs.eax = result;
+            }
+        },
+
         // AND AL, imm8
         0x24 => {
             const imm = try fetchByte(cpu);
@@ -543,6 +798,34 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
                 cpu.flags.updateArithmetic32(result, false, false);
                 cpu.regs.eax = result;
             }
+        },
+
+        // DAA - Decimal Adjust AL after Addition
+        0x27 => {
+            var al = @as(u8, @truncate(cpu.regs.eax));
+            var old_cf = cpu.flags.carry;
+            var old_al = al;
+
+            if ((al & 0x0F) > 9 or cpu.flags.auxiliary) {
+                al +%= 6;
+                cpu.flags.carry = old_cf or (al < 6);
+                cpu.flags.auxiliary = true;
+            } else {
+                cpu.flags.auxiliary = false;
+            }
+
+            if (old_al > 0x99 or old_cf) {
+                al +%= 0x60;
+                cpu.flags.carry = true;
+            } else {
+                cpu.flags.carry = false;
+            }
+
+            cpu.regs.setReg8(0, al);
+            // Update flags
+            cpu.flags.zero = al == 0;
+            cpu.flags.sign = (al & 0x80) != 0;
+            cpu.flags.parity = @popCount(al) & 1 == 0;
         },
 
         // AND r/m8, r8
@@ -593,6 +876,54 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             }
         },
 
+        // DAS - Decimal Adjust AL after Subtraction
+        0x2F => {
+            var al = @as(u8, @truncate(cpu.regs.eax));
+            var old_cf = cpu.flags.carry;
+            var old_al = al;
+
+            if ((al & 0x0F) > 9 or cpu.flags.auxiliary) {
+                al -%= 6;
+                cpu.flags.carry = old_cf or (old_al < 6);
+                cpu.flags.auxiliary = true;
+            } else {
+                cpu.flags.auxiliary = false;
+            }
+
+            if (old_al > 0x99 or old_cf) {
+                al -%= 0x60;
+                cpu.flags.carry = true;
+            } else {
+                cpu.flags.carry = false;
+            }
+
+            cpu.regs.setReg8(0, al);
+            // Update flags
+            cpu.flags.zero = al == 0;
+            cpu.flags.sign = (al & 0x80) != 0;
+            cpu.flags.parity = @popCount(al) & 1 == 0;
+        },
+
+
+        // AAA - ASCII Adjust AL after Addition
+        0x37 => {
+            var al = @as(u8, @truncate(cpu.regs.eax));
+            var ah = @as(u8, @truncate(cpu.regs.eax >> 8));
+
+            if ((al & 0x0F) > 9 or cpu.flags.auxiliary) {
+                al +%= 6;
+                ah +%= 1;
+                cpu.flags.auxiliary = true;
+                cpu.flags.carry = true;
+            } else {
+                cpu.flags.auxiliary = false;
+                cpu.flags.carry = false;
+            }
+
+            al &= 0x0F;
+            cpu.regs.setReg8(0, al); // AL
+            cpu.regs.setReg8(4, ah); // AH
+        },
         // CMP AL, imm8
         0x3C => {
             const imm = try fetchByte(cpu);
@@ -610,11 +941,32 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             }
         },
 
+        // AAS - ASCII Adjust AL after Subtraction
+        0x3F => {
+            var al = @as(u8, @truncate(cpu.regs.eax));
+            var ah = @as(u8, @truncate(cpu.regs.eax >> 8));
+
+            if ((al & 0x0F) > 9 or cpu.flags.auxiliary) {
+                al -%= 6;
+                ah -%= 1;
+                cpu.flags.auxiliary = true;
+                cpu.flags.carry = true;
+            } else {
+                cpu.flags.auxiliary = false;
+                cpu.flags.carry = false;
+            }
+
+            al &= 0x0F;
+            cpu.regs.setReg8(0, al); // AL
+            cpu.regs.setReg8(4, ah); // AH
+        },
+
         // XCHG r/m8, r8
         0x86 => {
             const modrm = try fetchModRM(cpu);
             const reg_val = cpu.regs.getReg8(modrm.reg);
             const rm_val = try readRM8(cpu, modrm);
+
             cpu.regs.setReg8(modrm.reg, rm_val);
             try writeRM8(cpu, modrm, reg_val);
         },
@@ -997,10 +1349,24 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             }
         },
 
+        // INT3 - Breakpoint
+        0xCC => {
+            // Raise #BP (breakpoint exception, vector 3)
+            try handleInterrupt(cpu, 3);
+        },
+
         // INT imm8
         0xCD => {
             const vector = try fetchByte(cpu);
             try handleInterrupt(cpu, vector);
+        },
+
+        // INTO - Interrupt on overflow
+        0xCE => {
+            // If OF flag is set, raise INT 4
+            if (cpu.flags.overflow) {
+                try handleInterrupt(cpu, 4);
+            }
         },
 
         // IRET/IRETD - Return from interrupt
@@ -1231,6 +1597,84 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             try executeGroup1(cpu, opcode);
         },
 
+
+        // AAM - ASCII Adjust AX after Multiply
+        0xD4 => {
+            const base = try fetchByte(cpu);
+            var al = @as(u8, @truncate(cpu.regs.eax));
+
+            if (base == 0) {
+                return CpuError.DivideByZero;
+            }
+
+            const ah = al / base;
+            al = al % base;
+
+            cpu.regs.setReg8(0, al); // AL
+            cpu.regs.setReg8(4, ah); // AH
+
+            // Update flags
+            cpu.flags.zero = al == 0;
+            cpu.flags.sign = (al & 0x80) != 0;
+            cpu.flags.parity = @popCount(al) & 1 == 0;
+            // CF, OF, AF are undefined
+        },
+
+        // AAD - ASCII Adjust AX before Division
+        0xD5 => {
+            const base = try fetchByte(cpu);
+            var al = @as(u8, @truncate(cpu.regs.eax));
+            const ah = @as(u8, @truncate(cpu.regs.eax >> 8));
+
+            al = (ah *% base) +% al;
+
+            cpu.regs.setReg8(0, al); // AL
+            cpu.regs.setReg8(4, 0);  // AH = 0
+
+            // Update flags
+            cpu.flags.zero = al == 0;
+            cpu.flags.sign = (al & 0x80) != 0;
+            cpu.flags.parity = @popCount(al) & 1 == 0;
+            // CF, OF, AF are undefined
+        },
+        // SALC/SETALC - Set AL from carry (undocumented but used)
+        0xD6 => {
+            // AL = 0xFF if CF=1, else AL = 0x00
+            cpu.regs.setReg8(0, if (cpu.flags.carry) 0xFF else 0x00);
+        },
+
+        // XLAT/XLATB - Table look-up translation
+        0xD7 => {
+            // AL = DS:[EBX + AL] (or DS:[BX + AL] with address size override)
+            const al = cpu.regs.getReg8(0);
+            const base = if (cpu.prefix.address_size_override)
+                @as(u32, cpu.regs.getReg16(3)) // BX
+            else
+                cpu.regs.ebx; // EBX
+
+            const seg = if (cpu.prefix.segment_override) |seg_idx|
+                cpu.segments.getSegment(seg_idx)
+            else
+                cpu.segments.ds;
+
+            const addr = cpu.getEffectiveAddress(seg, base +% al);
+            const value = try cpu.readMemByte(addr);
+            cpu.regs.setReg8(0, value);
+        },
+
+        // FPU ESC opcodes (0xD8-0xDF) - x87 FPU instructions
+        0xD8...0xDF => {
+            // These are FPU instructions. For now, implement as minimal stubs.
+            // Full FPU emulation is complex and not needed for basic operation.
+            // We need to skip the ModR/M byte to avoid crashes.
+            const modrm = try fetchModRM(cpu);
+
+            // If CR0.EM (emulation) bit is set, we should raise #NM (no math coprocessor)
+            // For now, just skip the instruction (no-op)
+            // In the future, we could check cpu.system.cr0.em and raise an exception
+            _ = modrm;
+        },
+
         // Group 2 - Shift/Rotate (C0, C1, D0, D1, D2, D3)
         0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3 => {
             try executeGroup2(cpu, opcode);
@@ -1420,6 +1864,125 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
             try executeGroup0(cpu);
         },
 
+        // LAR r16/32, r/m16 - Load Access Rights
+        0x02 => {
+            const modrm = try fetchModRM(cpu);
+            const selector = if (modrm.mod == 3)
+                cpu.regs.getReg16(modrm.rm)
+            else
+                try readRM16(cpu, modrm);
+
+            // LAR only works in protected mode
+            if (cpu.mode != .protected) {
+                cpu.flags.zero = false;
+                return;
+            }
+
+            // Get descriptor table and index
+            const ti = (selector >> 2) & 1; // Table indicator: 0 = GDT, 1 = LDT
+            const index = selector >> 3;
+            const dtr = if (ti == 0) cpu.system.gdtr else cpu.system.gdtr; // TODO: LDT support
+
+            // Check if selector is within table limit
+            const offset = @as(u32, index) * 8;
+            if (offset + 7 > dtr.limit or selector == 0) {
+                // Invalid selector
+                cpu.flags.zero = false;
+                return;
+            }
+
+            // Read descriptor from memory
+            var bytes: [8]u8 = undefined;
+            for (0..8) |i| {
+                bytes[i] = try cpu.readMemByte(dtr.base + offset + @as(u32, @intCast(i)));
+            }
+
+            const desc = cpu_mod.SegmentDescriptor.fromBytes(bytes);
+
+            // Check if descriptor is valid and accessible
+            if (!desc.isPresent()) {
+                cpu.flags.zero = false;
+                return;
+            }
+
+            // Load access rights into destination register
+            // Access rights are in bits 8-23 of the descriptor (bytes 5-6 + lower nibble of byte 7)
+            const access_rights: u32 = (@as(u32, bytes[6]) << 16) | (@as(u32, bytes[5]) << 8) | 0;
+
+            if (cpu.prefix.operand_size_override) {
+                // 16-bit: Load lower 16 bits
+                cpu.regs.setReg16(modrm.reg, @truncate(access_rights >> 8));
+            } else {
+                // 32-bit: Load full access rights (bits 8-31, bits 0-7 are zero)
+                cpu.regs.setReg32(modrm.reg, access_rights & 0x00FFFF00);
+            }
+
+            cpu.flags.zero = true;
+        },
+
+        // LSL r16/32, r/m16 - Load Segment Limit
+        0x03 => {
+            const modrm = try fetchModRM(cpu);
+            const selector = if (modrm.mod == 3)
+                cpu.regs.getReg16(modrm.rm)
+            else
+                try readRM16(cpu, modrm);
+
+            // LSL only works in protected mode
+            if (cpu.mode != .protected) {
+                cpu.flags.zero = false;
+                return;
+            }
+
+            // Get descriptor table and index
+            const ti = (selector >> 2) & 1; // Table indicator: 0 = GDT, 1 = LDT
+            const index = selector >> 3;
+            const dtr = if (ti == 0) cpu.system.gdtr else cpu.system.gdtr; // TODO: LDT support
+
+            // Check if selector is within table limit
+            const offset = @as(u32, index) * 8;
+            if (offset + 7 > dtr.limit or selector == 0) {
+                // Invalid selector
+                cpu.flags.zero = false;
+                return;
+            }
+
+            // Read descriptor from memory
+            var bytes: [8]u8 = undefined;
+            for (0..8) |i| {
+                bytes[i] = try cpu.readMemByte(dtr.base + offset + @as(u32, @intCast(i)));
+            }
+
+            const desc = cpu_mod.SegmentDescriptor.fromBytes(bytes);
+
+            // Check if descriptor is valid and accessible
+            if (!desc.isPresent()) {
+                cpu.flags.zero = false;
+                return;
+            }
+
+            // Load effective segment limit
+            const limit = desc.getEffectiveLimit();
+
+            if (cpu.prefix.operand_size_override) {
+                // 16-bit: Load lower 16 bits of limit
+                cpu.regs.setReg16(modrm.reg, @truncate(limit));
+            } else {
+                // 32-bit: Load full limit
+                cpu.regs.setReg32(modrm.reg, limit);
+            }
+
+            cpu.flags.zero = true;
+        },
+
+
+        // UD2 - Undefined Instruction (intentionally raises #UD)
+        0x0B => {
+            // Raise Invalid Opcode exception
+            return CpuError.InvalidOpcode;
+        },
+
+
         // Group 7 (LGDT, LIDT, etc.)
         0x01 => {
             try executeGroup7(cpu);
@@ -1463,6 +2026,53 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
                 4 => cpu.system.cr4 = cpu_mod.CR4.fromU32(value),
                 else => return CpuError.InvalidOpcode,
             }
+        },
+
+        // MOV r32, DRn - Move from debug register
+        0x21 => {
+            const modrm = try fetchModRM(cpu);
+            const value = switch (modrm.reg) {
+                0 => cpu.system.dr0,
+                1 => cpu.system.dr1,
+                2 => cpu.system.dr2,
+                3 => cpu.system.dr3,
+                4 => cpu.system.dr6, // DR4 is aliased to DR6
+                5 => cpu.system.dr7, // DR5 is aliased to DR7
+                6 => cpu.system.dr6,
+                7 => cpu.system.dr7,
+            };
+            cpu.regs.setReg32(modrm.rm, value);
+        },
+
+        // MOV DRn, r32 - Move to debug register
+        0x23 => {
+            const modrm = try fetchModRM(cpu);
+            const value = cpu.regs.getReg32(modrm.rm);
+            switch (modrm.reg) {
+                0 => cpu.system.dr0 = value,
+                1 => cpu.system.dr1 = value,
+                2 => cpu.system.dr2 = value,
+                3 => cpu.system.dr3 = value,
+                4 => cpu.system.dr6 = value, // DR4 is aliased to DR6
+                5 => cpu.system.dr7 = value, // DR5 is aliased to DR7
+                6 => cpu.system.dr6 = value,
+                7 => cpu.system.dr7 = value,
+            }
+        },
+
+        // MOV r32, TRn - Move from test register (obsolete, stub as no-op)
+        0x24 => {
+            const modrm = try fetchModRM(cpu);
+            // Test registers are obsolete (only on 486 and earlier)
+            // Return 0 for compatibility
+            cpu.regs.setReg32(modrm.rm, 0);
+        },
+
+        // MOV TRn, r32 - Move to test register (obsolete, stub as no-op)
+        0x26 => {
+            _ = try fetchModRM(cpu);
+            // Test registers are obsolete (only on 486 and earlier)
+            // Ignore writes for compatibility
         },
 
         // WBINVD (Write-Back and Invalidate Cache)
@@ -1889,6 +2499,146 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
                 try cpu.writeMemDword(addr + 4, cpu.regs.ecx);
             } else {
                 // ZF=0, m64 -> EDX:EAX
+
+/// Execute Group 0 instructions (SLDT, STR, LLDT, LTR, VERR, VERW)
+fn executeGroup0(cpu: *Cpu) !void {
+    const modrm = try fetchModRM(cpu);
+
+    switch (modrm.reg) {
+        // SLDT - Store Local Descriptor Table Register
+        0 => {
+            if (modrm.mod == 3) {
+                // Register operand
+                cpu.regs.setReg16(modrm.rm, cpu.system.ldtr);
+            } else {
+                // Memory operand
+                const addr = try calculateEffectiveAddress(cpu, modrm);
+                try cpu.writeMemWord(addr, cpu.system.ldtr);
+            }
+        },
+        // STR - Store Task Register
+        1 => {
+            if (modrm.mod == 3) {
+                // Register operand
+                cpu.regs.setReg16(modrm.rm, cpu.system.tr);
+            } else {
+                // Memory operand
+                const addr = try calculateEffectiveAddress(cpu, modrm);
+                try cpu.writeMemWord(addr, cpu.system.tr);
+            }
+        },
+        // LLDT - Load Local Descriptor Table Register
+        2 => {
+            const value = if (modrm.mod == 3)
+                cpu.regs.getReg16(modrm.rm)
+            else
+                blk: {
+                    const addr = try calculateEffectiveAddress(cpu, modrm);
+                    break :blk try cpu.readMemWord(addr);
+                };
+            cpu.system.ldtr = value;
+        },
+        // LTR - Load Task Register
+        3 => {
+            const value = if (modrm.mod == 3)
+                cpu.regs.getReg16(modrm.rm)
+            else
+                blk: {
+                    const addr = try calculateEffectiveAddress(cpu, modrm);
+                    break :blk try cpu.readMemWord(addr);
+                };
+            cpu.system.tr = value;
+        },
+        // VERR - Verify Segment for Reading
+        4 => {
+            const selector = if (modrm.mod == 3)
+                cpu.regs.getReg16(modrm.rm)
+            else
+                blk: {
+                    const addr = try calculateEffectiveAddress(cpu, modrm);
+                    break :blk try cpu.readMemWord(addr);
+                };
+
+            // In protected mode, check if segment is readable
+            if (cpu.mode == .protected) {
+                // Get descriptor table and index
+                const ti = (selector >> 2) & 1;
+                const index = selector >> 3;
+                const dtr = if (ti == 0) cpu.system.gdtr else cpu.system.gdtr; // TODO: LDT
+
+                // Check if selector is within table limit
+                const offset = @as(u32, index) * 8;
+                if (offset + 7 <= dtr.limit and selector != 0) {
+                    // Read descriptor
+                    var bytes: [8]u8 = undefined;
+                    for (0..8) |i| {
+                        bytes[i] = try cpu.readMemByte(dtr.base + offset + @as(u32, @intCast(i)));
+                    }
+                    const desc = cpu_mod.SegmentDescriptor.fromBytes(bytes);
+
+                    // ZF=1 if segment is valid, present, and readable
+                    if (desc.isPresent() and desc.isReadable()) {
+                        cpu.flags.zero = true;
+                    } else {
+                        cpu.flags.zero = false;
+                    }
+                } else {
+                    cpu.flags.zero = false;
+                }
+            } else {
+                // In real mode, always readable
+                cpu.flags.zero = true;
+            }
+        },
+        // VERW - Verify Segment for Writing
+        5 => {
+            const selector = if (modrm.mod == 3)
+                cpu.regs.getReg16(modrm.rm)
+            else
+                blk: {
+                    const addr = try calculateEffectiveAddress(cpu, modrm);
+                    break :blk try cpu.readMemWord(addr);
+                };
+
+            // In protected mode, check if segment is writable
+            if (cpu.mode == .protected) {
+                // Get descriptor table and index
+                const ti = (selector >> 2) & 1;
+                const index = selector >> 3;
+                const dtr = if (ti == 0) cpu.system.gdtr else cpu.system.gdtr; // TODO: LDT
+
+                // Check if selector is within table limit
+                const offset = @as(u32, index) * 8;
+                if (offset + 7 <= dtr.limit and selector != 0) {
+                    // Read descriptor
+                    var bytes: [8]u8 = undefined;
+                    for (0..8) |i| {
+                        bytes[i] = try cpu.readMemByte(dtr.base + offset + @as(u32, @intCast(i)));
+                    }
+                    const desc = cpu_mod.SegmentDescriptor.fromBytes(bytes);
+
+                    // ZF=1 if segment is valid, present, and writable
+                    if (desc.isPresent() and desc.isData() and desc.isWritable()) {
+                        cpu.flags.zero = true;
+                    } else {
+                        cpu.flags.zero = false;
+                    }
+                } else {
+                    cpu.flags.zero = false;
+                }
+            } else {
+                // In real mode, always writable
+                cpu.flags.zero = true;
+            }
+        },
+        else => {
+            cpu.dumpInstructionHistory();
+            std.debug.print("\nINVALID GROUP 0 INSTRUCTION: 0F 00 /{d} at {X:04}:{X:08}\n", .{ modrm.reg, cpu.current_instr_cs, cpu.current_instr_eip });
+            @panic("Unhandled Group 0 instruction");
+        },
+    }
+}
+
                 cpu.flags.zero = false;
                 cpu.regs.eax = mem_low;
                 cpu.regs.edx = mem_high;
@@ -2804,6 +3554,77 @@ fn subWithFlags32(cpu: *Cpu, a: u32, b: u32) u32 {
     return result;
 }
 
+
+// ADC (Add with Carry) helpers
+fn adcWithFlags8(cpu: *Cpu, a: u8, b: u8) u8 {
+    const carry_in: u8 = if (cpu.flags.carry) 1 else 0;
+    const result_full = @as(u16, a) + @as(u16, b) + @as(u16, carry_in);
+    const result: u8 = @truncate(result_full);
+    const carry = result_full > 0xFF;
+    const overflow = ((a ^ result) & (b ^ result) & 0x80) != 0;
+    cpu.flags.updateArithmetic8(result, carry, overflow);
+    // Set auxiliary flag for carry from bit 3 to bit 4
+    cpu.flags.auxiliary = ((a & 0x0F) + (b & 0x0F) + carry_in) > 0x0F;
+    return result;
+}
+
+fn adcWithFlags16(cpu: *Cpu, a: u16, b: u16) u16 {
+    const carry_in: u16 = if (cpu.flags.carry) 1 else 0;
+    const result_full = @as(u32, a) + @as(u32, b) + @as(u32, carry_in);
+    const result: u16 = @truncate(result_full);
+    const carry = result_full > 0xFFFF;
+    const overflow = ((a ^ result) & (b ^ result) & 0x8000) != 0;
+    cpu.flags.updateArithmetic16(result, carry, overflow);
+    // Set auxiliary flag for carry from bit 3 to bit 4
+    cpu.flags.auxiliary = ((a & 0x0F) + (b & 0x0F) + carry_in) > 0x0F;
+    return result;
+}
+
+fn adcWithFlags32(cpu: *Cpu, a: u32, b: u32) u32 {
+    const carry_in: u32 = if (cpu.flags.carry) 1 else 0;
+    const result_full = @as(u64, a) + @as(u64, b) + @as(u64, carry_in);
+    const result: u32 = @truncate(result_full);
+    const carry = result_full > 0xFFFFFFFF;
+    const overflow = ((a ^ result) & (b ^ result) & 0x80000000) != 0;
+    cpu.flags.updateArithmetic32(result, carry, overflow);
+    // Set auxiliary flag for carry from bit 3 to bit 4
+    cpu.flags.auxiliary = ((a & 0x0F) + (b & 0x0F) + carry_in) > 0x0F;
+    return result;
+}
+
+// SBB (Subtract with Borrow) helpers
+fn sbbWithFlags8(cpu: *Cpu, a: u8, b: u8) u8 {
+    const borrow_in: u8 = if (cpu.flags.carry) 1 else 0;
+    const result = a -% b -% borrow_in;
+    const carry = (@as(u16, a) < (@as(u16, b) + @as(u16, borrow_in)));
+    const overflow = ((a ^ b) & (a ^ result) & 0x80) != 0;
+    cpu.flags.updateArithmetic8(result, carry, overflow);
+    // Set auxiliary flag for borrow from bit 4 to bit 3
+    cpu.flags.auxiliary = (@as(i8, @bitCast(a & 0x0F)) - @as(i8, @bitCast(b & 0x0F)) - @as(i8, @bitCast(borrow_in))) < 0;
+    return result;
+}
+
+fn sbbWithFlags16(cpu: *Cpu, a: u16, b: u16) u16 {
+    const borrow_in: u16 = if (cpu.flags.carry) 1 else 0;
+    const result = a -% b -% borrow_in;
+    const carry = (@as(u32, a) < (@as(u32, b) + @as(u32, borrow_in)));
+    const overflow = ((a ^ b) & (a ^ result) & 0x8000) != 0;
+    cpu.flags.updateArithmetic16(result, carry, overflow);
+    // Set auxiliary flag for borrow from bit 4 to bit 3
+    cpu.flags.auxiliary = (@as(i16, @bitCast(a & 0x0F)) - @as(i16, @bitCast(b & 0x0F)) - @as(i16, @bitCast(borrow_in))) < 0;
+    return result;
+}
+
+fn sbbWithFlags32(cpu: *Cpu, a: u32, b: u32) u32 {
+    const borrow_in: u32 = if (cpu.flags.carry) 1 else 0;
+    const result = a -% b -% borrow_in;
+    const carry = (@as(u64, a) < (@as(u64, b) + @as(u64, borrow_in)));
+    const overflow = ((a ^ b) & (a ^ result) & 0x80000000) != 0;
+    cpu.flags.updateArithmetic32(result, carry, overflow);
+    // Set auxiliary flag for borrow from bit 4 to bit 3
+    cpu.flags.auxiliary = (@as(i32, @bitCast(a & 0x0F)) - @as(i32, @bitCast(b & 0x0F)) - @as(i32, @bitCast(borrow_in))) < 0;
+    return result;
+}
 // String instruction helpers
 fn execMovs(cpu: *Cpu, size: u8) !void {
     const rep_prefix = cpu.prefix.rep;
@@ -3095,6 +3916,122 @@ fn execScas(cpu: *Cpu, size: u8) !void {
             }
 
             cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+        },
+    }
+}
+
+
+
+// I/O string operations
+
+fn execIns(cpu: *Cpu, size: u8) !void {
+    const rep_prefix = cpu.prefix.rep;
+    const delta: i32 = if (cpu.flags.direction) -@as(i32, size) else @as(i32, size);
+    const port: u16 = @truncate(cpu.regs.edx);
+
+    switch (rep_prefix) {
+        .rep, .repne => {
+            // REP prefix - repeat while ECX != 0
+            while (cpu.regs.ecx != 0) {
+                // Read from I/O port DX
+                const value = switch (size) {
+                    1 => @as(u32, try cpu.inByte(port)),
+                    2 => @as(u32, try cpu.inWord(port)),
+                    4 => try cpu.inDword(port),
+                    else => unreachable,
+                };
+
+                // Write to ES:[EDI]
+                const addr = cpu.getEffectiveAddress(cpu.segments.es, cpu.regs.edi);
+                switch (size) {
+                    1 => try cpu.writeMemByte(addr, @truncate(value)),
+                    2 => try cpu.writeMemWord(addr, @truncate(value)),
+                    4 => try cpu.writeMemDword(addr, value),
+                    else => unreachable,
+                }
+
+                // Update EDI and decrement ECX
+                cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+                cpu.regs.ecx -%= 1;
+            }
+        },
+        .none => {
+            // No REP prefix - execute once
+            // Read from I/O port DX
+            const value = switch (size) {
+                1 => @as(u32, try cpu.inByte(port)),
+                2 => @as(u32, try cpu.inWord(port)),
+                4 => try cpu.inDword(port),
+                else => unreachable,
+            };
+
+            // Write to ES:[EDI]
+            const addr = cpu.getEffectiveAddress(cpu.segments.es, cpu.regs.edi);
+            switch (size) {
+                1 => try cpu.writeMemByte(addr, @truncate(value)),
+                2 => try cpu.writeMemWord(addr, @truncate(value)),
+                4 => try cpu.writeMemDword(addr, value),
+                else => unreachable,
+            }
+
+            // Update EDI
+            cpu.regs.edi = @bitCast(@as(i32, @bitCast(cpu.regs.edi)) +% delta);
+        },
+    }
+}
+
+fn execOuts(cpu: *Cpu, size: u8) !void {
+    const rep_prefix = cpu.prefix.rep;
+    const delta: i32 = if (cpu.flags.direction) -@as(i32, size) else @as(i32, size);
+    const port: u16 = @truncate(cpu.regs.edx);
+
+    switch (rep_prefix) {
+        .rep, .repne => {
+            // REP prefix - repeat while ECX != 0
+            while (cpu.regs.ecx != 0) {
+                // Read from DS:[ESI]
+                const addr = cpu.getEffectiveAddress(cpu.segments.ds, cpu.regs.esi);
+                const value = switch (size) {
+                    1 => @as(u32, try cpu.readMemByte(addr)),
+                    2 => @as(u32, try cpu.readMemWord(addr)),
+                    4 => try cpu.readMemDword(addr),
+                    else => unreachable,
+                };
+
+                // Write to I/O port DX
+                switch (size) {
+                    1 => try cpu.outByte(port, @truncate(value)),
+                    2 => try cpu.outWord(port, @truncate(value)),
+                    4 => try cpu.outDword(port, value),
+                    else => unreachable,
+                }
+
+                // Update ESI and decrement ECX
+                cpu.regs.esi = @bitCast(@as(i32, @bitCast(cpu.regs.esi)) +% delta);
+                cpu.regs.ecx -%= 1;
+            }
+        },
+        .none => {
+            // No REP prefix - execute once
+            // Read from DS:[ESI]
+            const addr = cpu.getEffectiveAddress(cpu.segments.ds, cpu.regs.esi);
+            const value = switch (size) {
+                1 => @as(u32, try cpu.readMemByte(addr)),
+                2 => @as(u32, try cpu.readMemWord(addr)),
+                4 => try cpu.readMemDword(addr),
+                else => unreachable,
+            };
+
+            // Write to I/O port DX
+            switch (size) {
+                1 => try cpu.outByte(port, @truncate(value)),
+                2 => try cpu.outWord(port, @truncate(value)),
+                4 => try cpu.outDword(port, value),
+                else => unreachable,
+            }
+
+            // Update ESI
+            cpu.regs.esi = @bitCast(@as(i32, @bitCast(cpu.regs.esi)) +% delta);
         },
     }
 }
@@ -5321,4 +6258,1080 @@ test "clts: clear task-switched flag" {
 
     // CR0.TS should now be false
     try std.testing.expectEqual(false, cpu.system.cr0.ts);
+}
+
+test "mov debug registers: write and read" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.eip = 0;
+
+    // MOV DR0, EAX - Write 0x12345678 to DR0
+    cpu.regs.eax = 0x12345678;
+    try mem.writeByte(0, 0x0F); // Two-byte opcode prefix
+    try mem.writeByte(1, 0x23); // MOV DRn, r32
+    try mem.writeByte(2, 0xC0); // ModR/M: DR0, EAX (11 000 000)
+
+    try cpu.step();
+    try std.testing.expectEqual(@as(u32, 0x12345678), cpu.system.dr0);
+
+    // MOV EBX, DR0 - Read DR0 into EBX
+    cpu.eip = 3;
+    try mem.writeByte(3, 0x0F); // Two-byte opcode prefix
+    try mem.writeByte(4, 0x21); // MOV r32, DRn
+    try mem.writeByte(5, 0xC3); // ModR/M: DR0, EBX (11 000 011)
+
+    try cpu.step();
+    try std.testing.expectEqual(@as(u32, 0x12345678), cpu.regs.ebx);
+}
+
+test "mov debug registers: DR6 and DR7 power-up values" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Check power-up values per Intel spec
+    try std.testing.expectEqual(@as(u32, 0xFFFF0FF0), cpu.system.dr6);
+    try std.testing.expectEqual(@as(u32, 0x00000400), cpu.system.dr7);
+}
+
+test "mov debug registers: DR4 and DR5 aliases" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.eip = 0;
+
+    // MOV DR4, EAX (should write to DR6)
+    cpu.regs.eax = 0xAABBCCDD;
+    try mem.writeByte(0, 0x0F); // Two-byte opcode prefix
+    try mem.writeByte(1, 0x23); // MOV DRn, r32
+    try mem.writeByte(2, 0xE0); // ModR/M: DR4, EAX (11 100 000)
+
+    try cpu.step();
+    try std.testing.expectEqual(@as(u32, 0xAABBCCDD), cpu.system.dr6);
+
+    // MOV DR5, EDX (should write to DR7)
+    cpu.eip = 3;
+    cpu.regs.edx = 0x11223344;
+    try mem.writeByte(3, 0x0F); // Two-byte opcode prefix
+    try mem.writeByte(4, 0x23); // MOV DRn, r32
+    try mem.writeByte(5, 0xEA); // ModR/M: DR5, EDX (11 101 010)
+
+    try cpu.step();
+    try std.testing.expectEqual(@as(u32, 0x11223344), cpu.system.dr7);
+}
+
+test "clc: clear carry flag" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.eip = 0;
+
+    // Set carry flag
+    cpu.flags.carry = true;
+
+    // CLC (0xF8)
+    try mem.writeByte(0, 0xF8);
+
+    try cpu.step();
+    try std.testing.expectEqual(false, cpu.flags.carry);
+}
+
+test "stc: set carry flag" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.eip = 0;
+
+    // Clear carry flag
+    cpu.flags.carry = false;
+
+    // STC (0xF9)
+    try mem.writeByte(0, 0xF9);
+
+    try cpu.step();
+    try std.testing.expectEqual(true, cpu.flags.carry);
+}
+
+test "cmc: complement carry flag" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.eip = 0;
+
+    // Set carry flag
+    cpu.flags.carry = true;
+
+    // CMC (0xF5) - should complement to false
+    try mem.writeByte(0, 0xF5);
+    try cpu.step();
+    try std.testing.expectEqual(false, cpu.flags.carry);
+
+    // CMC (0xF5) - should complement to true
+    cpu.eip = 1;
+    try mem.writeByte(1, 0xF5);
+    try cpu.step();
+    try std.testing.expectEqual(true, cpu.flags.carry);
+}
+
+test "multi-byte nop: 0F 1F" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.eip = 0;
+
+    // Save initial state
+    const initial_eax = cpu.regs.eax;
+
+    // Multi-byte NOP: 0x0F 0x1F with ModR/M
+    try mem.writeByte(0, 0x0F); // Two-byte opcode prefix
+    try mem.writeByte(1, 0x1F); // Hint NOP
+    try mem.writeByte(2, 0xC0); // ModR/M (required, but ignored)
+
+    try cpu.step();
+
+    // Verify it's a true NOP - no register changes
+    try std.testing.expectEqual(initial_eax, cpu.regs.eax);
+    try std.testing.expectEqual(@as(u32, 3), cpu.eip);
+}
+
+test "prefetch nop: 0F 0D" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.eip = 0;
+
+    // Prefetch NOP: 0x0F 0x0D with ModR/M
+    try mem.writeByte(0, 0x0F); // Two-byte opcode prefix
+    try mem.writeByte(1, 0x0D); // PREFETCH
+    try mem.writeByte(2, 0xC0); // ModR/M (required, but ignored)
+
+    try cpu.step();
+
+    // Verify it advanced EIP correctly
+    try std.testing.expectEqual(@as(u32, 3), cpu.eip);
+}
+
+test "mov test registers: obsolete no-ops" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.eip = 0;
+
+    // MOV r32, TRn - should return 0
+    try mem.writeByte(0, 0x0F); // Two-byte opcode prefix
+    try mem.writeByte(1, 0x24); // MOV r32, TRn
+    try mem.writeByte(2, 0xC0); // ModR/M: TR0, EAX
+
+    cpu.regs.eax = 0xFFFFFFFF;
+    try cpu.step();
+    try std.testing.expectEqual(@as(u32, 0), cpu.regs.eax);
+
+    // MOV TRn, r32 - should be no-op
+    cpu.eip = 3;
+    cpu.regs.ebx = 0x12345678;
+    try mem.writeByte(3, 0x0F); // Two-byte opcode prefix
+    try mem.writeByte(4, 0x26); // MOV TRn, r32
+    try mem.writeByte(5, 0xC3); // ModR/M: TR0, EBX
+
+    try cpu.step();
+    // Just verify it doesn't crash and advances EIP
+    try std.testing.expectEqual(@as(u32, 6), cpu.eip);
+}
+test "insb: input byte from UART to memory" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    // Register UART at port 0x3F8
+    try io_ctrl.registerUart(io_mod.IoController.COM1_BASE);
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.regs.edx = 0x3F8; // Port in DX
+    cpu.regs.edi = 0x100; // Destination address
+    cpu.segments.es = 0; // ES segment
+
+    // Write test data to UART input
+    if (io_ctrl.getUart(io_mod.IoController.COM1_BASE)) |uart| {
+        try uart.rx_buffer.append('T');
+        uart.lsr.data_ready = true;
+    }
+
+    // INSB: 0x6C
+    try mem.writeByte(0, 0x6C);
+
+    try cpu.step();
+
+    // Verify byte was read from port and written to ES:[EDI]
+    const result = try mem.readByte(0x100);
+    try std.testing.expectEqual(@as(u8, 'T'), result);
+    // Verify EDI was incremented
+    try std.testing.expectEqual(@as(u32, 0x101), cpu.regs.edi);
+}
+
+test "outsb: output byte from memory to UART" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    // Register UART at port 0x3F8
+    try io_ctrl.registerUart(io_mod.IoController.COM1_BASE);
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.regs.edx = 0x3F8; // Port in DX
+    cpu.regs.esi = 0x100; // Source address
+    cpu.segments.ds = 0; // DS segment
+
+    // Write test data to memory
+    try mem.writeByte(0x100, 'X');
+
+    // OUTSB: 0x6E
+    try mem.writeByte(0, 0x6E);
+
+    try cpu.step();
+
+    // Verify byte was written to UART
+    if (io_ctrl.getUart(io_mod.IoController.COM1_BASE)) |uart| {
+        const output = uart.getOutputBuffer();
+        try std.testing.expectEqual(@as(usize, 1), output.len);
+        try std.testing.expectEqual(@as(u8, 'X'), output[0]);
+    }
+    // Verify ESI was incremented
+    try std.testing.expectEqual(@as(u32, 0x101), cpu.regs.esi);
+}
+
+test "rep insb: input multiple bytes from UART" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    // Register UART at port 0x3F8
+    try io_ctrl.registerUart(io_mod.IoController.COM1_BASE);
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.regs.edx = 0x3F8; // Port in DX
+    cpu.regs.edi = 0x200; // Destination address
+    cpu.regs.ecx = 4; // Read 4 bytes
+    cpu.segments.es = 0; // ES segment
+
+    // REP prefix (0xF3) + INSB (0x6C)
+    try mem.writeByte(0, 0xF3);
+    try mem.writeByte(1, 0x6C);
+
+    // Note: In real usage, the UART would provide data.
+    // For this test, we'll get 0xFF from uninitialized UART reads
+    try cpu.step();
+
+    // Verify ECX was decremented to 0
+    try std.testing.expectEqual(@as(u32, 0), cpu.regs.ecx);
+    // Verify EDI was incremented by 4
+    try std.testing.expectEqual(@as(u32, 0x204), cpu.regs.edi);
+}
+
+test "rep outsw: output multiple words to port" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    // Register UART at port 0x3F8
+    try io_ctrl.registerUart(io_mod.IoController.COM1_BASE);
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.regs.edx = 0x3F8; // Port in DX
+    cpu.regs.esi = 0x300; // Source address
+    cpu.regs.ecx = 2; // Write 2 words
+    cpu.segments.ds = 0; // DS segment
+
+    // Write test data to memory
+    try mem.writeWord(0x300, 0x4142); // "BA" in little-endian
+    try mem.writeWord(0x302, 0x4344); // "DC" in little-endian
+
+    // REP prefix (0xF3) + Operand size override (0x66) + OUTSW (0x6F)
+    try mem.writeByte(0, 0xF3);
+    try mem.writeByte(1, 0x66);
+    try mem.writeByte(2, 0x6F);
+
+    try cpu.step();
+
+    // Verify ECX was decremented to 0
+    try std.testing.expectEqual(@as(u32, 0), cpu.regs.ecx);
+    // Verify ESI was incremented by 4 (2 words)
+    try std.testing.expectEqual(@as(u32, 0x304), cpu.regs.esi);
+
+    // Verify bytes were written to UART (as individual byte writes)
+    if (io_ctrl.getUart(io_mod.IoController.COM1_BASE)) |uart| {
+        const output = uart.getOutputBuffer();
+        try std.testing.expectEqual(@as(usize, 4), output.len);
+        try std.testing.expectEqual(@as(u8, 0x42), output[0]); // Low byte of first word
+        try std.testing.expectEqual(@as(u8, 0x41), output[1]); // High byte of first word
+        try std.testing.expectEqual(@as(u8, 0x44), output[2]); // Low byte of second word
+        try std.testing.expectEqual(@as(u8, 0x43), output[3]); // High byte of second word
+    }
+}
+
+test "insw with direction flag: decrement EDI" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.regs.edx = 0x60; // Arbitrary port
+    cpu.regs.edi = 0x400; // Destination address
+    cpu.segments.es = 0; // ES segment
+    cpu.flags.direction = true; // Set direction flag (decrement)
+
+    // Operand size override (0x66) + INSW (0x6D)
+    try mem.writeByte(0, 0x66);
+    try mem.writeByte(1, 0x6D);
+
+    try cpu.step();
+
+    // Verify EDI was decremented by 2 (word size)
+    try std.testing.expectEqual(@as(u32, 0x3FE), cpu.regs.edi);
+}
+
+
+test "bound: index within bounds (16-bit)" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set up bounds in memory at address 0x1000
+    // Lower bound: 10, Upper bound: 100
+    try mem.writeWord(0x1000, 10); // lower
+    try mem.writeWord(0x1002, 100); // upper
+
+    // Set up BOUND instruction: 0x66 0x62 /r (16-bit)
+    // BOUND AX, [0x1000]
+    // ModR/M: mod=00 (memory, no displacement), reg=000 (AX), rm=110 (disp16)
+    cpu.regs.eax = 50; // AX = 50 (within bounds [10, 100])
+    try mem.writeByte(0, 0x66); // Operand size override
+    try mem.writeByte(1, 0x62); // BOUND opcode
+    try mem.writeByte(2, 0x06); // ModR/M: mod=00, reg=000, rm=110
+    try mem.writeWord(3, 0x1000); // 16-bit displacement
+
+    cpu.eip = 0;
+    // Should not raise error when index is within bounds
+    try cpu.step();
+
+    // CPU should have advanced past the instruction
+    try std.testing.expectEqual(@as(u32, 5), cpu.eip);
+}
+
+test "bound: index out of bounds raises error (32-bit)" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set up bounds in memory at address 0x1000
+    // Lower bound: 100, Upper bound: 200
+    try mem.writeDword(0x1000, 100); // lower
+    try mem.writeDword(0x1004, 200); // upper
+
+    // Set up BOUND instruction: 0x62 /r (32-bit)
+    // BOUND EAX, [0x1000]
+    cpu.regs.eax = 300; // EAX = 300 (out of bounds, > 200)
+    try mem.writeByte(0, 0x62); // BOUND opcode
+    try mem.writeByte(1, 0x06); // ModR/M: mod=00, reg=000 (EAX), rm=110 (disp16)
+    try mem.writeWord(2, 0x1000); // 16-bit displacement
+
+    cpu.eip = 0;
+    // Should raise GeneralProtectionFault when index is out of bounds
+    try std.testing.expectError(cpu_mod.CpuError.GeneralProtectionFault, cpu.step());
+}
+
+test "arpl: adjust RPL when dest < src" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.mode = .protected; // ARPL only works in protected mode
+
+    // ARPL BX, AX
+    // AX = selector with RPL=3 (0x0003)
+    // BX = selector with RPL=1 (0x0011)
+    cpu.regs.eax = 0x0003; // Selector with RPL=3
+    cpu.regs.ebx = 0x0011; // Selector 0x0010 with RPL=1
+
+    // ARPL r/m16, r16: 0x63 /r
+    // ModR/M: mod=11 (register), reg=000 (AX), rm=011 (BX)
+    try mem.writeByte(0, 0x63); // ARPL opcode
+    try mem.writeByte(1, 0xC3); // ModR/M: 11 000 011
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // BX should now have RPL=3 (adjusted from 1 to 3)
+    try std.testing.expectEqual(@as(u16, 0x0013), cpu.regs.getReg16(3)); // BX = 0x0013
+    // ZF should be set because adjustment occurred
+    try std.testing.expect(cpu.flags.zero);
+}
+
+test "arpl: no adjustment when dest >= src" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 16 * 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    cpu.mode = .protected; // ARPL only works in protected mode
+
+    // ARPL BX, AX
+    // AX = selector with RPL=1 (0x0001)
+    // BX = selector with RPL=3 (0x0013)
+    cpu.regs.eax = 0x0001; // Selector with RPL=1
+    cpu.regs.ebx = 0x0013; // Selector 0x0010 with RPL=3
+
+    // ARPL r/m16, r16: 0x63 /r
+    try mem.writeByte(0, 0x63); // ARPL opcode
+    try mem.writeByte(1, 0xC3); // ModR/M: 11 000 011 (AX, BX)
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // BX should remain unchanged (RPL=3 >= RPL=1)
+    try std.testing.expectEqual(@as(u16, 0x0013), cpu.regs.getReg16(3)); // BX unchanged
+    // ZF should be clear because no adjustment occurred
+    try std.testing.expect(!cpu.flags.zero);
+}
+
+test "xlat: table lookup translation" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set up a translation table at DS:EBX
+    const table_base: u32 = 0x1000;
+    cpu.regs.ebx = table_base;
+    cpu.segments.ds = 0x0000;
+
+    // Write translation table values
+    // Table[0] = 'A', Table[1] = 'B', Table[2] = 'C', etc.
+    try mem.writeByte(table_base + 0, 'A');
+    try mem.writeByte(table_base + 1, 'B');
+    try mem.writeByte(table_base + 2, 'C');
+    try mem.writeByte(table_base + 3, 'D');
+    try mem.writeByte(table_base + 10, 'X');
+
+    // Test 1: AL = 0, should load 'A'
+    cpu.regs.setReg8(0, 0); // AL = 0
+    cpu.eip = 0;
+    try mem.writeByte(0, 0xD7); // XLAT
+    try cpu.step();
+    try std.testing.expectEqual(@as(u8, 'A'), cpu.regs.getReg8(0));
+
+    // Test 2: AL = 2, should load 'C'
+    cpu.regs.setReg8(0, 2); // AL = 2
+    cpu.eip = 1;
+    try mem.writeByte(1, 0xD7); // XLAT
+    try cpu.step();
+    try std.testing.expectEqual(@as(u8, 'C'), cpu.regs.getReg8(0));
+
+    // Test 3: AL = 10, should load 'X'
+    cpu.regs.setReg8(0, 10); // AL = 10
+    cpu.eip = 2;
+    try mem.writeByte(2, 0xD7); // XLAT
+    try cpu.step();
+    try std.testing.expectEqual(@as(u8, 'X'), cpu.regs.getReg8(0));
+}
+
+test "wait: fpu wait instruction" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // WAIT is a no-op in our emulator (no FPU)
+    // Just verify it executes without error
+    cpu.eip = 0;
+    try mem.writeByte(0, 0x9B); // WAIT
+
+    const eip_before = cpu.eip;
+    try cpu.step();
+    const eip_after = cpu.eip;
+
+    // EIP should have advanced by 1 (consumed the WAIT opcode)
+    try std.testing.expectEqual(eip_before + 1, eip_after);
+}
+
+test "into: interrupt on overflow when OF=1" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Set up IVT entry for INT 4 at address 0x10 (4 * 4 = 16 = 0x10)
+    // IVT format: offset (2 bytes), segment (2 bytes)
+    try mem.writeWord(0x10, 0x0100); // IP = 0x0100
+    try mem.writeWord(0x12, 0x0000); // CS = 0x0000
+
+    // Test 1: OF=1, should trigger interrupt
+    cpu.flags.overflow = true;
+    cpu.eip = 0;
+    cpu.regs.esp = 0x1000; // Set up stack
+    try mem.writeByte(0, 0xCE); // INTO
+
+    try cpu.step();
+
+    // Should have jumped to INT 4 handler at CS:IP = 0000:0100
+    try std.testing.expectEqual(@as(u32, 0x0100), cpu.eip);
+    try std.testing.expectEqual(@as(u16, 0x0000), cpu.segments.cs);
+}
+
+test "into: no interrupt when OF=0" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+
+    var mem = try memory.Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = io_mod.IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test 2: OF=0, should not trigger interrupt
+    cpu.flags.overflow = false;
+    cpu.eip = 0;
+    try mem.writeByte(0, 0xCE); // INTO
+
+    try cpu.step();
+
+    // Should have simply advanced EIP by 1
+    try std.testing.expectEqual(@as(u32, 1), cpu.eip);
+}
+
+test "adc instruction: 8-bit with carry" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+    const Memory = memory.Memory;
+    const IoController = io_mod.IoController;
+
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // ADC AL, 0x05 with CF=1
+    cpu.regs.eax = 0x10; // AL = 0x10
+    cpu.flags.carry = true;
+
+    try mem.writeByte(0, 0x14); // ADC AL, imm8
+    try mem.writeByte(1, 0x05);
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // Result should be 0x10 + 0x05 + 1 (carry) = 0x16
+    try std.testing.expectEqual(@as(u8, 0x16), cpu.regs.getReg8(0)); // AL
+    try std.testing.expect(!cpu.flags.carry);
+    try std.testing.expect(cpu.flags.auxiliary);
+}
+
+test "adc instruction: 32-bit with carry" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+    const Memory = memory.Memory;
+    const IoController = io_mod.IoController;
+
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // ADC EAX, imm32 with CF=1
+    cpu.regs.eax = 0xFFFFFFFF;
+    cpu.flags.carry = true;
+
+    try mem.writeByte(0, 0x15); // ADC EAX, imm32
+    try mem.writeDword(1, 0x00000000);
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // Result should be 0xFFFFFFFF + 0 + 1 (carry) = 0x00000000 with carry set
+    try std.testing.expectEqual(@as(u32, 0x00000000), cpu.regs.eax);
+    try std.testing.expect(cpu.flags.carry);
+    try std.testing.expect(cpu.flags.zero);
+}
+
+test "sbb instruction: 8-bit with borrow" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+    const Memory = memory.Memory;
+    const IoController = io_mod.IoController;
+
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // SBB AL, 0x05 with CF=1 (borrow)
+    cpu.regs.eax = 0x10; // AL = 0x10
+    cpu.flags.carry = true;
+
+    try mem.writeByte(0, 0x1C); // SBB AL, imm8
+    try mem.writeByte(1, 0x05);
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // Result should be 0x10 - 0x05 - 1 (borrow) = 0x0A
+    try std.testing.expectEqual(@as(u8, 0x0A), cpu.regs.getReg8(0)); // AL
+    try std.testing.expect(!cpu.flags.carry);
+}
+
+test "sbb instruction: 32-bit underflow with borrow" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+    const Memory = memory.Memory;
+    const IoController = io_mod.IoController;
+
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // SBB EAX, imm32 with CF=1
+    cpu.regs.eax = 0x00000005;
+    cpu.flags.carry = true;
+
+    try mem.writeByte(0, 0x1D); // SBB EAX, imm32
+    try mem.writeDword(1, 0x00000005);
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // Result should be 5 - 5 - 1 (borrow) = 0xFFFFFFFF with carry set
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), cpu.regs.eax);
+    try std.testing.expect(cpu.flags.carry);
+}
+
+test "daa instruction: after addition" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+    const Memory = memory.Memory;
+    const IoController = io_mod.IoController;
+
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test DAA with AL = 0x1C (low nibble > 9)
+    cpu.regs.eax = 0x1C; // AL = 0x1C
+    cpu.flags.auxiliary = false;
+    cpu.flags.carry = false;
+
+    try mem.writeByte(0, 0x27); // DAA
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // After DAA: AL should be 0x22 (0x1C + 0x06)
+    try std.testing.expectEqual(@as(u8, 0x22), cpu.regs.getReg8(0)); // AL
+    try std.testing.expect(!cpu.flags.carry);
+}
+
+test "daa instruction: with carry" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+    const Memory = memory.Memory;
+    const IoController = io_mod.IoController;
+
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test DAA with AL = 0xA5 (high nibble > 9)
+    cpu.regs.eax = 0xA5; // AL = 0xA5
+    cpu.flags.auxiliary = false;
+    cpu.flags.carry = false;
+
+    try mem.writeByte(0, 0x27); // DAA
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // After DAA: AL should be 0x05 with carry set (0xA5 + 0x60 = 0x105)
+    try std.testing.expectEqual(@as(u8, 0x05), cpu.regs.getReg8(0)); // AL
+    try std.testing.expect(cpu.flags.carry);
+}
+
+test "das instruction: after subtraction" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+    const Memory = memory.Memory;
+    const IoController = io_mod.IoController;
+
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test DAS with AL = 0x1C (low nibble > 9)
+    cpu.regs.eax = 0x1C; // AL = 0x1C
+    cpu.flags.auxiliary = false;
+    cpu.flags.carry = false;
+
+    try mem.writeByte(0, 0x2F); // DAS
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // After DAS: AL should be 0x16 (0x1C - 0x06)
+    try std.testing.expectEqual(@as(u8, 0x16), cpu.regs.getReg8(0)); // AL
+}
+
+test "aaa instruction: adjust after addition" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+    const Memory = memory.Memory;
+    const IoController = io_mod.IoController;
+
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test AAA with AL = 0x0C (low nibble > 9)
+    cpu.regs.eax = 0x0C; // AL = 0x0C, AH = 0x00
+
+    try mem.writeByte(0, 0x37); // AAA
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // After AAA: AL = 0x02 (0x0C + 6 = 0x12, masked to 0x02), AH = 0x01
+    try std.testing.expectEqual(@as(u8, 0x02), cpu.regs.getReg8(0)); // AL
+    try std.testing.expectEqual(@as(u8, 0x01), cpu.regs.getReg8(4)); // AH
+    try std.testing.expect(cpu.flags.carry);
+    try std.testing.expect(cpu.flags.auxiliary);
+}
+
+test "aaa instruction: no adjustment needed" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+    const Memory = memory.Memory;
+    const IoController = io_mod.IoController;
+
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test AAA with AL = 0x05 (low nibble <= 9)
+    cpu.regs.eax = 0x0105; // AL = 0x05, AH = 0x01
+
+    try mem.writeByte(0, 0x37); // AAA
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // After AAA: AL = 0x05, AH = 0x01 (no change)
+    try std.testing.expectEqual(@as(u8, 0x05), cpu.regs.getReg8(0)); // AL
+    try std.testing.expectEqual(@as(u8, 0x01), cpu.regs.getReg8(4)); // AH
+    try std.testing.expect(!cpu.flags.carry);
+}
+
+test "aas instruction: adjust after subtraction" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+    const Memory = memory.Memory;
+    const IoController = io_mod.IoController;
+
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test AAS with AL = 0x0C (low nibble > 9)
+    cpu.regs.eax = 0x020C; // AL = 0x0C, AH = 0x02
+
+    try mem.writeByte(0, 0x3F); // AAS
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // After AAS: AL = 0x06 (0x0C - 6 = 0x06, masked to 0x06), AH = 0x01
+    try std.testing.expectEqual(@as(u8, 0x06), cpu.regs.getReg8(0)); // AL
+    try std.testing.expectEqual(@as(u8, 0x01), cpu.regs.getReg8(4)); // AH
+    try std.testing.expect(cpu.flags.carry);
+}
+
+test "aam instruction: basic operation" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+    const Memory = memory.Memory;
+    const IoController = io_mod.IoController;
+
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test AAM with AL = 0x2D (45 decimal)
+    cpu.regs.eax = 0x2D; // AL = 45
+
+    try mem.writeByte(0, 0xD4); // AAM
+    try mem.writeByte(1, 0x0A); // base = 10
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // After AAM: AH = 45 / 10 = 4, AL = 45 % 10 = 5
+    try std.testing.expectEqual(@as(u8, 0x05), cpu.regs.getReg8(0)); // AL
+    try std.testing.expectEqual(@as(u8, 0x04), cpu.regs.getReg8(4)); // AH
+    try std.testing.expect(!cpu.flags.zero);
+}
+
+test "aam instruction: with different base" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+    const Memory = memory.Memory;
+    const IoController = io_mod.IoController;
+
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test AAM with AL = 0x10 (16 decimal), base = 4
+    cpu.regs.eax = 0x10; // AL = 16
+
+    try mem.writeByte(0, 0xD4); // AAM
+    try mem.writeByte(1, 0x04); // base = 4
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // After AAM: AH = 16 / 4 = 4, AL = 16 % 4 = 0
+    try std.testing.expectEqual(@as(u8, 0x00), cpu.regs.getReg8(0)); // AL
+    try std.testing.expectEqual(@as(u8, 0x04), cpu.regs.getReg8(4)); // AH
+    try std.testing.expect(cpu.flags.zero);
+}
+
+test "aad instruction: basic operation" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+    const Memory = memory.Memory;
+    const IoController = io_mod.IoController;
+
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test AAD with AH = 0x04, AL = 0x05 (BCD 45)
+    cpu.regs.eax = 0x0405; // AH = 4, AL = 5
+
+    try mem.writeByte(0, 0xD5); // AAD
+    try mem.writeByte(1, 0x0A); // base = 10
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // After AAD: AL = 4 * 10 + 5 = 45 (0x2D), AH = 0
+    try std.testing.expectEqual(@as(u8, 0x2D), cpu.regs.getReg8(0)); // AL
+    try std.testing.expectEqual(@as(u8, 0x00), cpu.regs.getReg8(4)); // AH
+    try std.testing.expect(!cpu.flags.zero);
+}
+
+test "aad instruction: with different base" {
+    const allocator = std.testing.allocator;
+    const memory = @import("../memory/memory.zig");
+    const io_mod = @import("../io/io.zig");
+    const Memory = memory.Memory;
+    const IoController = io_mod.IoController;
+
+    var mem = try Memory.init(allocator, 1024);
+    defer mem.deinit();
+    var io_ctrl = IoController.init(allocator);
+    defer io_ctrl.deinit();
+
+    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+
+    // Test AAD with AH = 0x03, AL = 0x02, base = 5
+    cpu.regs.eax = 0x0302; // AH = 3, AL = 2
+
+    try mem.writeByte(0, 0xD5); // AAD
+    try mem.writeByte(1, 0x05); // base = 5
+
+    cpu.eip = 0;
+    try cpu.step();
+
+    // After AAD: AL = 3 * 5 + 2 = 17 (0x11), AH = 0
+    try std.testing.expectEqual(@as(u8, 0x11), cpu.regs.getReg8(0)); // AL
+    try std.testing.expectEqual(@as(u8, 0x00), cpu.regs.getReg8(4)); // AH
 }

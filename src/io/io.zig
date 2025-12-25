@@ -311,6 +311,32 @@ pub const IoController = struct {
 
         // Unhandled ports are ignored
     }
+
+    /// Read word from I/O port (little-endian)
+    pub fn readWord(self: *Self, port: u16) !u16 {
+        const lo = try self.readByte(port);
+        const hi = try self.readByte(port + 1);
+        return (@as(u16, hi) << 8) | lo;
+    }
+
+    /// Write word to I/O port (little-endian)
+    pub fn writeWord(self: *Self, port: u16, value: u16) !void {
+        try self.writeByte(port, @truncate(value));
+        try self.writeByte(port + 1, @truncate(value >> 8));
+    }
+
+    /// Read dword from I/O port (little-endian)
+    pub fn readDword(self: *Self, port: u16) !u32 {
+        const w0 = try self.readWord(port);
+        const w1 = try self.readWord(port + 2);
+        return (@as(u32, w1) << 16) | w0;
+    }
+
+    /// Write dword to I/O port (little-endian)
+    pub fn writeDword(self: *Self, port: u16, value: u32) !void {
+        try self.writeWord(port, @truncate(value));
+        try self.writeWord(port + 2, @truncate(value >> 16));
+    }
 };
 
 // Tests

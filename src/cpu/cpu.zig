@@ -560,6 +560,26 @@ pub const Cpu = struct {
         try self.io_ctrl.writeByte(port, value);
     }
 
+    /// Read word from I/O port
+    pub fn inWord(self: *Self, port: u16) !u16 {
+        return self.io_ctrl.readWord(port);
+    }
+
+    /// Write word to I/O port
+    pub fn outWord(self: *Self, port: u16, value: u16) !void {
+        try self.io_ctrl.writeWord(port, value);
+    }
+
+    /// Read dword from I/O port
+    pub fn inDword(self: *Self, port: u16) !u32 {
+        return self.io_ctrl.readDword(port);
+    }
+
+    /// Write dword to I/O port
+    pub fn outDword(self: *Self, port: u16, value: u32) !void {
+        try self.io_ctrl.writeDword(port, value);
+    }
+
     /// Halt the CPU
     pub fn halt(self: *Self) void {
         self.halted = true;

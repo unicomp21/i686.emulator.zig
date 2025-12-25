@@ -451,6 +451,22 @@ pub const SystemRegisters = struct {
     cr3: CR3,
     /// Control Register 4
     cr4: CR4,
+    /// Debug Register 0 (Breakpoint Linear Address)
+    dr0: u32,
+    /// Debug Register 1 (Breakpoint Linear Address)
+    dr1: u32,
+    /// Debug Register 2 (Breakpoint Linear Address)
+    dr2: u32,
+    /// Debug Register 3 (Breakpoint Linear Address)
+    dr3: u32,
+    /// Debug Register 4 (reserved, alias for DR6)
+    dr4: u32,
+    /// Debug Register 5 (reserved, alias for DR7)
+    dr5: u32,
+    /// Debug Register 6 (Debug Status)
+    dr6: u32,
+    /// Debug Register 7 (Debug Control)
+    dr7: u32,
     /// Model Specific Register: IA32_SYSENTER_CS (0x174)
     msr_sysenter_cs: u32,
     /// Model Specific Register: IA32_SYSENTER_ESP (0x175)
@@ -470,6 +486,14 @@ pub const SystemRegisters = struct {
             .cr2 = 0,
             .cr3 = .{},
             .cr4 = .{},
+            .dr0 = 0,
+            .dr1 = 0,
+            .dr2 = 0,
+            .dr3 = 0,
+            .dr4 = 0,
+            .dr5 = 0,
+            .dr6 = 0xFFFF0FF0, // Power-up value per Intel spec
+            .dr7 = 0x00000400, // Power-up value per Intel spec
             .msr_sysenter_cs = 0,
             .msr_sysenter_esp = 0,
             .msr_sysenter_eip = 0,
