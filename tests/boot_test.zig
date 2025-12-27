@@ -3,8 +3,9 @@
 //! Tests for the Linux kernel boot protocol implementation.
 
 const std = @import("std");
-const Emulator = @import("../src/root.zig").Emulator;
-const boot = @import("../src/root.zig").boot;
+const emulator = @import("emulator");
+const Emulator = emulator.Emulator;
+const boot = emulator.boot;
 
 test "boot: parse minimal kernel header" {
     const allocator = std.testing.allocator;

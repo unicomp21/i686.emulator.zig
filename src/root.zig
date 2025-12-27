@@ -46,6 +46,8 @@ pub const Config = struct {
     enable_keyboard: bool = false,
     /// Enable debug mode
     debug_mode: bool = false,
+    /// Dump CPU state on error (registers + last N instructions)
+    dump_on_error: bool = false,
     /// Initial instruction pointer
     initial_ip: u32 = 0x0000_0000,
     /// Initial code segment (real mode)
@@ -120,8 +122,34 @@ pub const Emulator = struct {
     pub fn run(self: *Self) !void {
         self.fixPointers();
         while (!self.cpu_instance.isHalted()) {
-            try self.cpu_instance.step();
+            self.cpu_instance.step() catch |err| {
+                if (self.config.dump_on_error) {
+                    std.debug.print("\n!!! CPU Error: {s} !!!\n", .{@errorName(err)});
+                    self.cpu_instance.dumpState();
+                }
+                return err;
+            };
         }
+    }
+
+    /// Run with a cycle limit (useful for testing)
+    pub fn runCycles(self: *Self, max_cycles: usize) !void {
+        self.fixPointers();
+        var cycles: usize = 0;
+        while (!self.cpu_instance.isHalted() and cycles < max_cycles) : (cycles += 1) {
+            self.cpu_instance.step() catch |err| {
+                if (self.config.dump_on_error) {
+                    std.debug.print("\n!!! CPU Error: {s} !!!\n", .{@errorName(err)});
+                    self.cpu_instance.dumpState();
+                }
+                return err;
+            };
+        }
+    }
+
+    /// Dump current CPU state (for debugging)
+    pub fn dumpCpuState(self: *const Self) void {
+        self.cpu_instance.dumpState();
     }
 
     /// Load binary code into memory at specified address
@@ -177,19 +205,30 @@ pub const Emulator = struct {
     /// Parameters:
     ///   - kernel_data: Raw kernel image (bzImage format)
     ///   - cmdline: Kernel command line string (e.g., "console=ttyS0 root=/dev/sda1")
+    ///   - initrd_data: Optional initrd/initramfs image
     ///
     /// The kernel will be loaded according to the Linux boot protocol:
     ///   - Boot parameters at 0x10000 (zero page)
     ///   - Command line at 0x20000
     ///   - Protected-mode kernel at 0x100000 (1 MB)
+    ///   - Initrd at 0x7F00000 (if provided)
     ///   - CPU configured in protected mode with flat segments
     ///
     /// After calling this, use run() or step() to begin kernel execution.
     pub fn loadKernel(self: *Self, kernel_data: []const u8, cmdline: []const u8) !void {
+        try self.loadKernelWithInitrd(kernel_data, cmdline, null);
+    }
+
+    /// Load Linux kernel with optional initrd for direct boot
+    pub fn loadKernelWithInitrd(self: *Self, kernel_data: []const u8, cmdline: []const u8, initrd_data: ?[]const u8) !void {
         self.fixPointers();
 
         var direct_boot = try boot.DirectBoot.initFromMemory(self.allocator, kernel_data, cmdline);
         defer direct_boot.deinit();
+
+        if (initrd_data) |initrd| {
+            try direct_boot.setInitrdFromMemory(initrd);
+        }
 
         try direct_boot.load(self);
     }

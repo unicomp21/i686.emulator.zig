@@ -178,6 +178,9 @@ pub const Cpu = struct {
     /// Current instruction being decoded (for history)
     current_instr_eip: u32,
     current_instr_cs: u16,
+    /// Error code for exceptions that have one (GP, PF, etc.)
+    /// Set before returning the error, used in step() when raising the exception
+    exception_error_code: u32,
 
     const Self = @This();
 
@@ -214,6 +217,7 @@ pub const Cpu = struct {
             .instr_history_pos = 0,
             .current_instr_eip = 0,
             .current_instr_cs = 0,
+            .exception_error_code = 0,
         };
     }
 
@@ -232,6 +236,7 @@ pub const Cpu = struct {
         self.seg_cache = [_]SegmentDescriptor{SegmentDescriptor.fromBytes([8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 })} ** 6;
         self.instr_history = [_]InstrHistoryEntry{.{ .eip = 0, .cs = 0, .opcode = 0, .opcode2 = 0, .is_two_byte = false }} ** 32;
         self.instr_history_pos = 0;
+        self.exception_error_code = 0;
     }
 
     /// Record instruction in history buffer
@@ -262,6 +267,69 @@ pub const Cpu = struct {
             }
         }
         std.debug.print("=====================================\n", .{});
+    }
+
+    /// Dump full CPU state (registers, flags, mode, and instruction history)
+    /// Call this when an error occurs to help diagnose issues.
+    pub fn dumpState(self: *const Self) void {
+        std.debug.print("\n==================== CPU STATE DUMP ====================\n", .{});
+
+        // Mode
+        std.debug.print("Mode: {s}\n", .{@tagName(self.mode)});
+        std.debug.print("Halted: {}\n", .{self.halted});
+        std.debug.print("Cycles: {d}\n\n", .{self.cycles});
+
+        // General purpose registers
+        std.debug.print("=== REGISTERS ===\n", .{});
+        std.debug.print("EAX: {X:08}  EBX: {X:08}  ECX: {X:08}  EDX: {X:08}\n", .{
+            self.regs.eax, self.regs.ebx, self.regs.ecx, self.regs.edx,
+        });
+        std.debug.print("ESI: {X:08}  EDI: {X:08}  EBP: {X:08}  ESP: {X:08}\n", .{
+            self.regs.esi, self.regs.edi, self.regs.ebp, self.regs.esp,
+        });
+        std.debug.print("EIP: {X:08}\n\n", .{self.eip});
+
+        // Segment registers
+        std.debug.print("=== SEGMENTS ===\n", .{});
+        std.debug.print("CS: {X:04}  DS: {X:04}  ES: {X:04}  SS: {X:04}  FS: {X:04}  GS: {X:04}\n", .{
+            self.segments.cs, self.segments.ds, self.segments.es,
+            self.segments.ss, self.segments.fs, self.segments.gs,
+        });
+        std.debug.print("\n", .{});
+
+        // Flags
+        std.debug.print("=== FLAGS ===\n", .{});
+        std.debug.print("EFLAGS: {X:08}\n", .{self.flags.toU32()});
+        std.debug.print("  CF={d} PF={d} AF={d} ZF={d} SF={d} IF={d} DF={d} OF={d}\n", .{
+            @intFromBool(self.flags.carry),
+            @intFromBool(self.flags.parity),
+            @intFromBool(self.flags.auxiliary),
+            @intFromBool(self.flags.zero),
+            @intFromBool(self.flags.sign),
+            @intFromBool(self.flags.interrupt),
+            @intFromBool(self.flags.direction),
+            @intFromBool(self.flags.overflow),
+        });
+        std.debug.print("\n", .{});
+
+        // System registers
+        std.debug.print("=== SYSTEM REGISTERS ===\n", .{});
+        std.debug.print("CR0: {X:08}  CR2: {X:08}  CR3: {X:08}  CR4: {X:08}\n", .{
+            self.system.cr0.toU32(), self.system.cr2,
+            self.system.cr3.toU32(), self.system.cr4.toU32(),
+        });
+        std.debug.print("GDTR: base={X:08} limit={X:04}\n", .{
+            self.system.gdtr.base, self.system.gdtr.limit,
+        });
+        std.debug.print("IDTR: base={X:08} limit={X:04}\n", .{
+            self.system.idtr.base, self.system.idtr.limit,
+        });
+        std.debug.print("\n", .{});
+
+        // Instruction history
+        self.dumpInstructionHistory();
+
+        std.debug.print("=========================================================\n\n", .{});
     }
 
     /// Check if CPU is halted
@@ -326,21 +394,40 @@ pub const Cpu = struct {
             return;
         }
 
-        // Get descriptor table base and limit
+        // Get descriptor table base and limit based on TI bit
         const ti = (selector >> 2) & 1; // Table indicator: 0 = GDT, 1 = LDT
         const index = selector >> 3; // Descriptor index
-        const dtr = if (ti == 0) self.system.gdtr else self.system.gdtr; // TODO: LDT support
+
+        var table_base: u32 = undefined;
+        var table_limit: u32 = undefined;
+
+        if (ti == 0) {
+            // Use GDT
+            table_base = self.system.gdtr.base;
+            table_limit = self.system.gdtr.limit;
+        } else {
+            // Use LDT - must have been loaded via LLDT
+            if (self.system.ldtr == 0) {
+                // No LDT loaded - GP fault with selector as error code
+                self.exception_error_code = selector;
+                return CpuError.GeneralProtectionFault;
+            }
+            table_base = self.system.ldtr_base;
+            table_limit = self.system.ldtr_limit;
+        }
 
         // Check if index is within table limit
         const offset = @as(u32, index) * 8;
-        if (offset + 7 > dtr.limit) {
+        if (offset + 7 > table_limit) {
+            // Selector out of bounds - GP fault with selector as error code
+            self.exception_error_code = selector;
             return CpuError.GeneralProtectionFault;
         }
 
         // Read 8-byte descriptor from memory
         var bytes: [8]u8 = undefined;
         for (0..8) |i| {
-            bytes[i] = try self.mem.readByte(dtr.base + offset + @as(u32, @intCast(i)));
+            bytes[i] = try self.mem.readByte(table_base + offset + @as(u32, @intCast(i)));
         }
 
         self.seg_cache[cache_index] = SegmentDescriptor.fromBytes(bytes);
@@ -528,8 +615,38 @@ pub const Cpu = struct {
         self.current_instr_eip = self.eip;
         self.current_instr_cs = self.segments.cs;
 
-        // Decode and execute instruction
-        try self.decodeAndExecute();
+        // Decode and execute instruction, catching exceptions
+        self.decodeAndExecute() catch |err| {
+            // Convert error to exception if applicable
+            switch (err) {
+                CpuError.InvalidOpcode => {
+                    // #UD - Invalid Opcode (vector 6)
+                    try self.raiseException(.invalid_opcode, null);
+                },
+                CpuError.DivisionByZero => {
+                    // #DE - Divide Error (vector 0)
+                    try self.raiseException(.divide_error, null);
+                },
+                CpuError.GeneralProtectionFault => {
+                    // #GP - General Protection Fault (vector 13)
+                    // Error code is the selector that caused the fault (set before returning error)
+                    try self.raiseException(.general_protection, self.exception_error_code);
+                },
+                CpuError.PageFault => {
+                    // #PF - Page Fault (vector 14)
+                    // CR2 should already contain the faulting address
+                    try self.raiseException(.page_fault, 0);
+                },
+                CpuError.StackFault => {
+                    // #SS - Stack Fault (vector 12)
+                    try self.raiseException(.stack_fault, 0);
+                },
+                else => {
+                    // Non-exception errors (Halted, OutOfBounds, etc.) propagate up
+                    return err;
+                },
+            }
+        };
 
         self.cycles += 1;
     }
@@ -664,6 +781,8 @@ pub const Cpu = struct {
 
             // Check if interrupt descriptor is within IDT limit
             if (offset + 7 > self.system.idtr.limit) {
+                // Error code is vector * 8 + 2 (IDT flag in error code)
+                self.exception_error_code = (@as(u32, vector) << 3) | 0x2;
                 return CpuError.GeneralProtectionFault;
             }
 
@@ -677,6 +796,8 @@ pub const Cpu = struct {
 
             // Check if gate is present
             if (!gate.isPresent()) {
+                // Error code is vector * 8 + 2 (IDT flag in error code)
+                self.exception_error_code = (@as(u32, vector) << 3) | 0x2;
                 return CpuError.GeneralProtectionFault;
             }
 
@@ -783,10 +904,10 @@ pub const Cpu = struct {
             // Real mode: use IVT at fixed location 0x00000000
             const vector_addr = @as(u32, vec) * 4;
 
-            // Push flags, CS, IP
-            try self.push(self.flags.toU32());
+            // Push flags, CS, IP (all 16-bit in real mode)
+            try self.push16(@truncate(self.flags.toU32()));
             try self.push16(self.segments.cs);
-            try self.push(@truncate(self.eip));
+            try self.push16(@truncate(self.eip));
 
             // In real mode, error codes are not pushed (they're a protected mode feature)
             // Some BIOS implementations might expect error codes, but standard real mode doesn't use them
@@ -921,13 +1042,14 @@ test "raise exception in real mode" {
     try std.testing.expectEqual(@as(u16, 0x0000), cpu.segments.cs);
 
     // Check that flags, CS, and IP were pushed onto stack
+    // In real mode, INT pushes 16-bit FLAGS, CS, and IP
     const pushed_ip = try mem.readWord(cpu.getEffectiveAddress(cpu.segments.ss, cpu.regs.esp));
     const pushed_cs = try mem.readWord(cpu.getEffectiveAddress(cpu.segments.ss, cpu.regs.esp + 2));
-    const pushed_flags = try mem.readDword(cpu.getEffectiveAddress(cpu.segments.ss, cpu.regs.esp + 4));
+    const pushed_flags = try mem.readWord(cpu.getEffectiveAddress(cpu.segments.ss, cpu.regs.esp + 4));
 
     try std.testing.expectEqual(@as(u16, @truncate(original_eip)), pushed_ip);
     try std.testing.expectEqual(original_cs, pushed_cs);
-    try std.testing.expectEqual(original_flags, pushed_flags);
+    try std.testing.expectEqual(@as(u16, @truncate(original_flags)), pushed_flags);
 }
 
 test "raise exception in protected mode with error code" {

@@ -1209,8 +1209,8 @@ test "integration: sysenter and sysexit" {
         // Set up return to user mode
         // mov ecx, user_stack (0x00001000)
         0xB9, 0x00, 0x10, 0x00, 0x00,
-        // mov edx, user_eip (0x0011 = after SYSENTER)
-        0xBA, 0x11, 0x00, 0x00, 0x00,
+        // mov edx, user_eip (0x000A = after SYSENTER)
+        0xBA, 0x0A, 0x00, 0x00, 0x00,
 
         // Execute SYSEXIT
         0x0F, 0x35,
@@ -1227,8 +1227,8 @@ test "integration: sysenter and sysexit" {
 
     // Configure SYSENTER MSRs
     emu.cpu_instance.system.msr_sysenter_cs = 0x0008; // Kernel CS
-    emu.cpu_instance.system.msr_sysenter_esp = 0xC0000000; // Kernel stack
-    emu.cpu_instance.system.msr_sysenter_eip = 0x80000000; // Kernel entry
+    emu.cpu_instance.system.msr_sysenter_esp = 0x00010000; // Kernel stack
+    emu.cpu_instance.system.msr_sysenter_eip = 0x00020000; // Kernel entry
 
     // Set up user mode segments
     emu.cpu_instance.segments.cs = 0x001B; // User CS (RPL=3)
@@ -1238,8 +1238,8 @@ test "integration: sysenter and sysexit" {
     // Load user code at 0x0000
     try emu.loadBinary(&user_code, 0x0000);
 
-    // Load kernel code at 0x80000000
-    try emu.loadBinary(&kernel_code, 0x80000000);
+    // Load kernel code at 0x00020000
+    try emu.loadBinary(&kernel_code, 0x00020000);
 
     // Run with cycle limit
     var cycles: usize = 0;
@@ -1597,7 +1597,8 @@ test "integration: ud2 raises invalid opcode exception" {
         0xF4, // hlt
 
         // Fill to offset 0x100 for exception handler
-    } ++ ([_]u8{0x90} ** (0x100 - 24)) ++ [_]u8{
+        // Initial code is 23 bytes (5+5+5+5+2+1), need 233 NOPs to reach 0x100
+    } ++ ([_]u8{0x90} ** (0x100 - 23)) ++ [_]u8{
         // Exception handler at offset 0x100
         0xBA, 0xF8, 0x03, 0x00, 0x00, // mov edx, 0x3F8 (UART)
         0xB0, 'X', // mov al, 'X'
@@ -1626,27 +1627,35 @@ test "integration: protected mode general protection fault" {
 
     // This test sets up protected mode, IDT, and triggers a #GP
     // by attempting to load an invalid segment selector
-    const code = [_]u8{
-        // Set up GDT at 0x1000
-        // GDT entry 0: null descriptor (required)
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offset 0x1000
-        // GDT entry 1: code segment (selector 0x08)
-        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, // offset 0x1008
-        // GDT entry 2: data segment (selector 0x10)
-        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00, // offset 0x1010
 
-        // Set up IDT at 0x2000
-        // IDT entry 13 (#GP): interrupt gate to handler at 0x08:0x3000
-        // Located at IDT base + (13 * 8) = 0x2068
-    } ++ ([_]u8{0x00} ** (0x2068 - 24)) ++ [_]u8{
+    // Memory layout:
+    // 0x0000 - 0x0FFF: unused
+    // 0x1000 - 0x1017: GDT (3 entries × 8 bytes = 24 bytes)
+    // 0x2000 - 0x2FFF: IDT (only entry 13 matters at 0x2068)
+    // 0x3000 - 0x3FFF: Exception handler
+    // 0x4000 - 0x4FFF: Main code and GDTR/IDTR
+
+    // GDT at 0x1000
+    const gdt = [_]u8{
+        // GDT entry 0: null descriptor (required)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // GDT entry 1: code segment (selector 0x08)
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00,
+        // GDT entry 2: data segment (selector 0x10)
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00,
+    };
+
+    // IDT entry 13 at 0x2068 (#GP): interrupt gate to handler at 0x08:0x3000
+    const idt_entry_13 = [_]u8{
         0x00, 0x30, // offset low (0x3000)
         0x08, 0x00, // selector (0x08)
         0x00, // reserved
         0x8E, // present, DPL=0, interrupt gate
         0x00, 0x00, // offset high
+    };
 
-        // Code at 0x3000: exception handler
-    } ++ ([_]u8{0x00} ** (0x3000 - 0x2070)) ++ [_]u8{
+    // Exception handler at 0x3000
+    const handler = [_]u8{
         // Protected mode #GP handler at 0x3000
         // Pop error code
         0x58, // pop eax (error code)
@@ -1655,9 +1664,13 @@ test "integration: protected mode general protection fault" {
         0xB0, 'E', // mov al, 'E'
         0xEE, // out dx, al
         0xF4, // hlt
+    };
 
-        // Main code starts at 0x4000
-    } ++ ([_]u8{0x00} ** (0x4000 - 0x300B)) ++ [_]u8{
+    // Main code at 0x4000
+    const main_code = [_]u8{
+        // Set up stack at 0x5000 (grows down)
+        0xBC, 0x00, 0x50, 0x00, 0x00, // mov esp, 0x5000
+
         // Load GDT
         0x0F, 0x01, 0x15, 0xF0, 0x4F, 0x00, 0x00, // lgdt [0x4FF0]
 
@@ -1676,14 +1689,16 @@ test "integration: protected mode general protection fault" {
 
         // Should never reach here
         0xF4, // hlt
+    };
 
+    // GDTR and IDTR at 0x4FF0
+    const gdtr_idtr = [_]u8{
         // GDTR value at 0x4FF0
-    } ++ ([_]u8{0x00} ** (0x4FF0 - 0x4020)) ++ [_]u8{
         0x17, 0x00, // limit (3 * 8 - 1 = 23 = 0x17)
         0x00, 0x10, 0x00, 0x00, // base (0x1000)
 
         // IDTR value at 0x4FF6
-        0xFF, 0x00, // limit (256 entries * 8 - 1 = 2047 = 0x7FF, but we use smaller)
+        0xFF, 0x00, // limit (256 entries)
         0x00, 0x20, 0x00, 0x00, // base (0x2000)
     };
 
@@ -1693,7 +1708,12 @@ test "integration: protected mode general protection fault" {
     });
     defer emu.deinit();
 
-    try emu.loadBinary(&code, 0x0000);
+    // Load each component at correct address
+    try emu.loadBinary(&gdt, 0x1000);
+    try emu.loadBinary(&idt_entry_13, 0x2068); // IDT entry 13 at offset 13*8 = 0x68 from base
+    try emu.loadBinary(&handler, 0x3000);
+    try emu.loadBinary(&main_code, 0x4000);
+    try emu.loadBinary(&gdtr_idtr, 0x4FF0);
 
     // Start execution at 0x4000 where main code is
     emu.cpu_instance.eip = 0x4000;
@@ -1921,7 +1941,7 @@ test "integration: real to protected mode boot" {
 
     // 2. Verify paging is enabled
     try std.testing.expect(emu.cpu_instance.system.cr0.pg); // Paging bit
-    try std.testing.expectEqual(@as(u32, 0x9000), emu.cpu_instance.system.cr3.page_directory_base << 12);
+    try std.testing.expectEqual(@as(u32, 0x9000), emu.cpu_instance.system.cr3.getPageDirectoryBase());
 
     // 3. Verify segment registers are loaded with protected mode selectors
     try std.testing.expectEqual(@as(u16, 0x0008), emu.cpu_instance.segments.cs); // Code segment

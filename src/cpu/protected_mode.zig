@@ -441,6 +441,10 @@ pub const SystemRegisters = struct {
     idtr: DescriptorTableRegister,
     /// Local Descriptor Table Register (selector)
     ldtr: u16,
+    /// LDT base address (loaded from GDT when LLDT is executed)
+    ldtr_base: u32,
+    /// LDT limit (loaded from GDT when LLDT is executed)
+    ldtr_limit: u32,
     /// Task Register (selector)
     tr: u16,
     /// Control Register 0
@@ -481,6 +485,8 @@ pub const SystemRegisters = struct {
             .gdtr = DescriptorTableRegister.init(),
             .idtr = DescriptorTableRegister.init(),
             .ldtr = 0,
+            .ldtr_base = 0,
+            .ldtr_limit = 0,
             .tr = 0,
             .cr0 = .{},
             .cr2 = 0,

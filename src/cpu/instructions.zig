@@ -10,6 +10,12 @@ const CpuError = cpu_mod.CpuError;
 const Exception = cpu_mod.Exception;
 const Flags = cpu_mod.Flags;
 
+// Additional imports for tests
+const memory = @import("../memory/memory.zig");
+const Memory = memory.Memory;
+const io_mod = @import("../io/io.zig");
+const IoController = io_mod.IoController;
+
 /// ModR/M byte decoding result
 const ModRM = struct {
     mod: u2,
@@ -26,12 +32,114 @@ fn decodeModRM(byte: u8) ModRM {
     };
 }
 
+/// Determine if 32-bit operand size is in effect.
+/// In real mode (16-bit default), the 0x66 prefix switches to 32-bit.
+/// In protected mode, the D bit of the CS descriptor determines the default:
+///   D=0 (16-bit): no override = 16-bit, override = 32-bit
+///   D=1 (32-bit): no override = 32-bit, override = 16-bit
+/// Note: VM86 mode is 16-bit like real mode.
+fn use32BitOperand(cpu: *Cpu) bool {
+    return switch (cpu.mode) {
+        .real, .vm86 => cpu.prefix.operand_size_override,
+        .protected => {
+            // Check CS descriptor's D bit (size flag)
+            // CS is cached at index 1
+            const cs_is_32bit = cpu.seg_cache[1].flags.size;
+            if (cs_is_32bit) {
+                // 32-bit default: override switches to 16-bit
+                return !cpu.prefix.operand_size_override;
+            } else {
+                // 16-bit default: override switches to 32-bit
+                return cpu.prefix.operand_size_override;
+            }
+        },
+    };
+}
+
+/// Descriptor table reference (base and limit)
+const DescriptorTableRef = struct {
+    base: u32,
+    limit: u32,
+};
+
+/// Get the descriptor table (GDT or LDT) based on the TI bit in a selector
+fn getDescriptorTable(cpu: *Cpu, selector: u16) ?DescriptorTableRef {
+    const ti = (selector >> 2) & 1; // Table indicator: 0 = GDT, 1 = LDT
+
+    if (ti == 0) {
+        // Use GDT
+        return DescriptorTableRef{
+            .base = cpu.system.gdtr.base,
+            .limit = cpu.system.gdtr.limit,
+        };
+    } else {
+        // Use LDT - must have been loaded via LLDT
+        if (cpu.system.ldtr == 0) {
+            return null; // No LDT loaded
+        }
+        return DescriptorTableRef{
+            .base = cpu.system.ldtr_base,
+            .limit = cpu.system.ldtr_limit,
+        };
+    }
+}
+
 /// Execute instruction based on opcode
 pub fn execute(cpu: *Cpu, opcode: u8) !void {
     // Record instruction in history
     cpu.recordInstruction(opcode, 0, false);
 
     switch (opcode) {
+        // ADD r/m8, r8
+        0x00 => {
+            const modrm = try fetchModRM(cpu);
+            const dst = try readRM8(cpu, modrm);
+            const src = cpu.regs.getReg8(modrm.reg);
+            const result = addWithFlags8(cpu, dst, src);
+            try writeRM8(cpu, modrm, result);
+        },
+
+        // ADD r/m16/32, r16/32
+        0x01 => {
+            const modrm = try fetchModRM(cpu);
+            if (cpu.prefix.operand_size_override) {
+                const dst = try readRM16(cpu, modrm);
+                const src = cpu.regs.getReg16(modrm.reg);
+                const result = addWithFlags16(cpu, dst, src);
+                try writeRM16(cpu, modrm, result);
+            } else {
+                const dst = try readRM32(cpu, modrm);
+                const src = cpu.regs.getReg32(modrm.reg);
+                const result = addWithFlags32(cpu, dst, src);
+                try writeRM32(cpu, modrm, result);
+            }
+        },
+
+        // ADD r8, r/m8
+        0x02 => {
+            const modrm = try fetchModRM(cpu);
+            const dst = cpu.regs.getReg8(modrm.reg);
+            const src = try readRM8(cpu, modrm);
+            const result = addWithFlags8(cpu, dst, src);
+            cpu.regs.setReg8(modrm.reg, result);
+        },
+
+        // ADD r16/32, r/m16/32
+        0x03 => {
+            const modrm = try fetchModRM(cpu);
+            if (cpu.prefix.operand_size_override) {
+                const dst = cpu.regs.getReg16(modrm.reg);
+                const src = try readRM16(cpu, modrm);
+                const result = addWithFlags16(cpu, dst, src);
+                cpu.regs.setReg16(modrm.reg, result);
+            } else {
+                const dst = cpu.regs.getReg32(modrm.reg);
+                const src = try readRM32(cpu, modrm);
+                const result = addWithFlags32(cpu, dst, src);
+                cpu.regs.setReg32(modrm.reg, result);
+            }
+        },
+
         // NOP
         0x90 => {},
 
@@ -266,6 +374,7 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             const modrm = try fetchModRM(cpu);
             // Cannot load CS with this instruction
             if (modrm.reg == 1) {
+                cpu.exception_error_code = 0; // #GP(0) for invalid operation
                 return CpuError.GeneralProtectionFault;
             }
             const value = try readRM16(cpu, modrm);
@@ -433,7 +542,8 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
                 // Raise #BR if index < lower or index > upper (for word/dword, it's upper + operand_size - 1)
                 if (index < lower or index > upper) {
                     // In a real CPU, this would raise interrupt #BR (vector 5)
-                    // For now, we return an error
+                    // For now, we return GP(0) as a placeholder
+                    cpu.exception_error_code = 0;
                     return CpuError.GeneralProtectionFault;
                 }
             } else {
@@ -443,6 +553,7 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
                 const upper: i32 = @bitCast(try cpu.readMemDword(addr + 4));
 
                 if (index < lower or index > upper) {
+                    cpu.exception_error_code = 0;
                     return CpuError.GeneralProtectionFault;
                 }
             }
@@ -804,8 +915,8 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
         // DAA - Decimal Adjust AL after Addition
         0x27 => {
             var al = @as(u8, @truncate(cpu.regs.eax));
-            var old_cf = cpu.flags.carry;
-            var old_al = al;
+            const old_cf = cpu.flags.carry;
+            const old_al = al;
 
             if ((al & 0x0F) > 9 or cpu.flags.auxiliary) {
                 al +%= 6;
@@ -880,8 +991,8 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
         // DAS - Decimal Adjust AL after Subtraction
         0x2F => {
             var al = @as(u8, @truncate(cpu.regs.eax));
-            var old_cf = cpu.flags.carry;
-            var old_al = al;
+            const old_cf = cpu.flags.carry;
+            const old_al = al;
 
             if ((al & 0x0F) > 9 or cpu.flags.auxiliary) {
                 al -%= 6;
@@ -925,6 +1036,51 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             cpu.regs.setReg8(0, al); // AL
             cpu.regs.setReg8(4, ah); // AH
         },
+
+        // CMP r/m8, r8
+        0x38 => {
+            const modrm = try fetchModRM(cpu);
+            const dst = try readRM8(cpu, modrm);
+            const src = cpu.regs.getReg8(modrm.reg);
+            _ = subWithFlags8(cpu, dst, src);
+        },
+
+        // CMP r/m16/32, r16/32
+        0x39 => {
+            const modrm = try fetchModRM(cpu);
+            if (cpu.prefix.operand_size_override) {
+                const dst = try readRM16(cpu, modrm);
+                const src = cpu.regs.getReg16(modrm.reg);
+                _ = subWithFlags16(cpu, dst, src);
+            } else {
+                const dst = try readRM32(cpu, modrm);
+                const src = cpu.regs.getReg32(modrm.reg);
+                _ = subWithFlags32(cpu, dst, src);
+            }
+        },
+
+        // CMP r8, r/m8
+        0x3A => {
+            const modrm = try fetchModRM(cpu);
+            const dst = cpu.regs.getReg8(modrm.reg);
+            const src = try readRM8(cpu, modrm);
+            _ = subWithFlags8(cpu, dst, src);
+        },
+
+        // CMP r16/32, r/m16/32
+        0x3B => {
+            const modrm = try fetchModRM(cpu);
+            if (cpu.prefix.operand_size_override) {
+                const dst = cpu.regs.getReg16(modrm.reg);
+                const src = try readRM16(cpu, modrm);
+                _ = subWithFlags16(cpu, dst, src);
+            } else {
+                const dst = cpu.regs.getReg32(modrm.reg);
+                const src = try readRM32(cpu, modrm);
+                _ = subWithFlags32(cpu, dst, src);
+            }
+        },
+
         // CMP AL, imm8
         0x3C => {
             const imm = try fetchByte(cpu);
@@ -1103,12 +1259,12 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
 
         // JMP ptr16:16/ptr16:32 - Far jump (direct)
         0xEA => {
-            if (cpu.prefix.operand_size_override) {
-                // 16-bit: JMP ptr16:16 (offset16, selector16)
-                const offset = try fetchWord(cpu);
+            if (use32BitOperand(cpu)) {
+                // 32-bit: JMP ptr16:32 (offset32, selector16)
+                const offset = try fetchDword(cpu);
                 const selector = try fetchWord(cpu);
 
-                // Load new CS and IP
+                // Load new CS and EIP
                 cpu.segments.cs = selector;
                 cpu.eip = offset;
 
@@ -1117,11 +1273,11 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
                     try cpu.loadSegmentDescriptor(cpu.segments.cs, 1); // CS is index 1
                 }
             } else {
-                // 32-bit: JMP ptr16:32 (offset32, selector16)
-                const offset = try fetchDword(cpu);
+                // 16-bit: JMP ptr16:16 (offset16, selector16)
+                const offset = try fetchWord(cpu);
                 const selector = try fetchWord(cpu);
 
-                // Load new CS and EIP
+                // Load new CS and IP
                 cpu.segments.cs = selector;
                 cpu.eip = offset;
 
@@ -1605,7 +1761,7 @@ pub fn execute(cpu: *Cpu, opcode: u8) !void {
             var al = @as(u8, @truncate(cpu.regs.eax));
 
             if (base == 0) {
-                return CpuError.DivideByZero;
+                return CpuError.DivisionByZero;
             }
 
             const ah = al / base;
@@ -1879,10 +2035,12 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
                 return;
             }
 
-            // Get descriptor table and index
-            const ti = (selector >> 2) & 1; // Table indicator: 0 = GDT, 1 = LDT
+            // Get descriptor table (GDT or LDT based on TI bit)
             const index = selector >> 3;
-            const dtr = if (ti == 0) cpu.system.gdtr else cpu.system.gdtr; // TODO: LDT support
+            const dtr = getDescriptorTable(cpu, selector) orelse {
+                cpu.flags.zero = false;
+                return;
+            };
 
             // Check if selector is within table limit
             const offset = @as(u32, index) * 8;
@@ -1935,10 +2093,12 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
                 return;
             }
 
-            // Get descriptor table and index
-            const ti = (selector >> 2) & 1; // Table indicator: 0 = GDT, 1 = LDT
+            // Get descriptor table (GDT or LDT based on TI bit)
             const index = selector >> 3;
-            const dtr = if (ti == 0) cpu.system.gdtr else cpu.system.gdtr; // TODO: LDT support
+            const dtr = getDescriptorTable(cpu, selector) orelse {
+                cpu.flags.zero = false;
+                return;
+            };
 
             // Check if selector is within table limit
             const offset = @as(u32, index) * 8;
@@ -2500,6 +2660,15 @@ fn executeTwoByteOpcode(cpu: *Cpu, opcode: u8) !void {
                 try cpu.writeMemDword(addr + 4, cpu.regs.ecx);
             } else {
                 // ZF=0, m64 -> EDX:EAX
+                cpu.flags.zero = false;
+                cpu.regs.eax = mem_low;
+                cpu.regs.edx = mem_high;
+            }
+        },
+
+        else => return CpuError.InvalidOpcode,
+    }
+}
 
 /// Execute Group 0 instructions (SLDT, STR, LLDT, LTR, VERR, VERW)
 fn executeGroup0(cpu: *Cpu) !void {
@@ -2530,14 +2699,47 @@ fn executeGroup0(cpu: *Cpu) !void {
         },
         // LLDT - Load Local Descriptor Table Register
         2 => {
-            const value = if (modrm.mod == 3)
+            const selector = if (modrm.mod == 3)
                 cpu.regs.getReg16(modrm.rm)
             else
                 blk: {
                     const addr = try calculateEffectiveAddress(cpu, modrm);
                     break :blk try cpu.readMemWord(addr);
                 };
-            cpu.system.ldtr = value;
+
+            // Store the selector
+            cpu.system.ldtr = selector;
+
+            // If selector is null, just clear the LDT
+            if (selector == 0) {
+                cpu.system.ldtr_base = 0;
+                cpu.system.ldtr_limit = 0;
+            } else {
+                // Look up the LDT descriptor in the GDT
+                // Note: LLDT always uses GDT (LDT descriptors are in GDT)
+                const index = selector >> 3;
+                const offset = @as(u32, index) * 8;
+
+                // Check if within GDT limit
+                if (offset + 7 > cpu.system.gdtr.limit) {
+                    cpu.exception_error_code = selector;
+                    return CpuError.GeneralProtectionFault;
+                }
+
+                // Read the LDT descriptor from GDT
+                var bytes: [8]u8 = undefined;
+                for (0..8) |i| {
+                    bytes[i] = try cpu.readMemByte(cpu.system.gdtr.base + offset + @as(u32, @intCast(i)));
+                }
+
+                const desc = cpu_mod.SegmentDescriptor.fromBytes(bytes);
+
+                // Verify it's an LDT descriptor (system type 0x2)
+                // Access byte should have descriptor_type = 0 (system) and type = 0010 (LDT)
+                // For simplicity, just extract base and limit
+                cpu.system.ldtr_base = desc.base;
+                cpu.system.ldtr_limit = desc.getEffectiveLimit();
+            }
         },
         // LTR - Load Task Register
         3 => {
@@ -2562,10 +2764,12 @@ fn executeGroup0(cpu: *Cpu) !void {
 
             // In protected mode, check if segment is readable
             if (cpu.mode == .protected) {
-                // Get descriptor table and index
-                const ti = (selector >> 2) & 1;
+                // Get descriptor table (GDT or LDT based on TI bit)
                 const index = selector >> 3;
-                const dtr = if (ti == 0) cpu.system.gdtr else cpu.system.gdtr; // TODO: LDT
+                const dtr = getDescriptorTable(cpu, selector) orelse {
+                    cpu.flags.zero = false;
+                    return;
+                };
 
                 // Check if selector is within table limit
                 const offset = @as(u32, index) * 8;
@@ -2603,10 +2807,12 @@ fn executeGroup0(cpu: *Cpu) !void {
 
             // In protected mode, check if segment is writable
             if (cpu.mode == .protected) {
-                // Get descriptor table and index
-                const ti = (selector >> 2) & 1;
+                // Get descriptor table (GDT or LDT based on TI bit)
                 const index = selector >> 3;
-                const dtr = if (ti == 0) cpu.system.gdtr else cpu.system.gdtr; // TODO: LDT
+                const dtr = getDescriptorTable(cpu, selector) orelse {
+                    cpu.flags.zero = false;
+                    return;
+                };
 
                 // Check if selector is within table limit
                 const offset = @as(u32, index) * 8;
@@ -2636,30 +2842,6 @@ fn executeGroup0(cpu: *Cpu) !void {
             cpu.dumpInstructionHistory();
             std.debug.print("\nINVALID GROUP 0 INSTRUCTION: 0F 00 /{d} at {X:04}:{X:08}\n", .{ modrm.reg, cpu.current_instr_cs, cpu.current_instr_eip });
             @panic("Unhandled Group 0 instruction");
-        },
-    }
-}
-
-                cpu.flags.zero = false;
-                cpu.regs.eax = mem_low;
-                cpu.regs.edx = mem_high;
-            }
-        },
-
-        // BSWAP r32 (0F C8+rd) - Byte swap register
-        0xC8...0xCF => {
-            const reg: u3 = @truncate(opcode & 0x7);
-            const value = cpu.regs.getReg32(reg);
-            // Swap byte order: 0x12345678 -> 0x78563412
-            const swapped = @byteSwap(value);
-            cpu.regs.setReg32(reg, swapped);
-        },
-
-        else => {
-            cpu.dumpInstructionHistory();
-            std.debug.print("\nINVALID TWO-BYTE OPCODE: 0F {X:02} at {X:04}:{X:08}\n", .{ opcode, cpu.current_instr_cs, cpu.current_instr_eip });
-            std.debug.print("Registers: EAX={X:08} EBX={X:08} ECX={X:08} EDX={X:08}\n", .{ cpu.regs.eax, cpu.regs.ebx, cpu.regs.ecx, cpu.regs.edx });
-            @panic("Unhandled two-byte opcode");
         },
     }
 }
@@ -3509,6 +3691,8 @@ fn addWithFlags8(cpu: *Cpu, a: u8, b: u8) u8 {
     const result: u8 = @truncate(result_full);
     const carry = result_full > 0xFF;
     const overflow = ((a ^ result) & (b ^ result) & 0x80) != 0;
+    // Auxiliary flag: carry from bit 3 to bit 4
+    cpu.flags.auxiliary = ((a & 0xF) + (b & 0xF)) > 0xF;
     cpu.flags.updateArithmetic8(result, carry, overflow);
     return result;
 }
@@ -3518,6 +3702,8 @@ fn addWithFlags16(cpu: *Cpu, a: u16, b: u16) u16 {
     const result: u16 = @truncate(result_full);
     const carry = result_full > 0xFFFF;
     const overflow = ((a ^ result) & (b ^ result) & 0x8000) != 0;
+    // Auxiliary flag: carry from bit 3 to bit 4
+    cpu.flags.auxiliary = ((a & 0xF) + (b & 0xF)) > 0xF;
     cpu.flags.updateArithmetic16(result, carry, overflow);
     return result;
 }
@@ -3527,6 +3713,8 @@ fn addWithFlags32(cpu: *Cpu, a: u32, b: u32) u32 {
     const result: u32 = @truncate(result_full);
     const carry = result_full > 0xFFFFFFFF;
     const overflow = ((a ^ result) & (b ^ result) & 0x80000000) != 0;
+    // Auxiliary flag: carry from bit 3 to bit 4
+    cpu.flags.auxiliary = ((a & 0xF) + (b & 0xF)) > 0xF;
     cpu.flags.updateArithmetic32(result, carry, overflow);
     return result;
 }
@@ -4090,8 +4278,8 @@ fn handleInterrupt(cpu: *Cpu, vector: u8) !void {
 // Tests
 test "nop instruction" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4109,8 +4297,8 @@ test "nop instruction" {
 
 test "mov immediate instructions" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4129,8 +4317,8 @@ test "mov immediate instructions" {
 
 test "enter instruction: simple (0, 0)" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4166,8 +4354,8 @@ test "enter instruction: simple (0, 0)" {
 
 test "enter instruction: with local space (16, 0)" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4203,8 +4391,8 @@ test "enter instruction: with local space (16, 0)" {
 
 test "enter instruction: with nesting (8, 1)" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4248,8 +4436,8 @@ test "enter instruction: with nesting (8, 1)" {
 
 test "enter and leave instruction pair" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4283,8 +4471,8 @@ test "enter and leave instruction pair" {
 
 test "wrmsr and rdmsr instructions" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4351,8 +4539,8 @@ test "wrmsr and rdmsr instructions" {
 
 test "sysenter instruction" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4398,8 +4586,8 @@ test "sysenter instruction" {
 
 test "sysexit instruction" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4447,8 +4635,8 @@ test "sysexit instruction" {
 
 test "sysenter and sysexit round trip" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -4516,8 +4704,8 @@ test "sysenter and sysexit round trip" {
 
 test "cmove instruction - condition true" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4546,8 +4734,8 @@ test "cmove instruction - condition true" {
 
 test "cmove instruction - condition false" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4576,8 +4764,8 @@ test "cmove instruction - condition false" {
 
 test "cmovne instruction - condition true" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4606,8 +4794,8 @@ test "cmovne instruction - condition true" {
 
 test "cmovl instruction - condition true" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4638,8 +4826,8 @@ test "cmovl instruction - condition true" {
 
 test "cmovg instruction - condition true" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4671,8 +4859,8 @@ test "cmovg instruction - condition true" {
 
 test "cmovg instruction - condition false" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4704,8 +4892,8 @@ test "cmovg instruction - condition false" {
 
 test "cmov 16-bit operands" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4735,8 +4923,8 @@ test "cmov 16-bit operands" {
 
 test "cmovs and cmovns instructions" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4777,8 +4965,8 @@ test "cmovs and cmovns instructions" {
 
 test "loop instruction: basic countdown" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4811,8 +4999,8 @@ test "loop instruction: basic countdown" {
 
 test "loop instruction: with address size override (CX)" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4836,8 +5024,8 @@ test "loop instruction: with address size override (CX)" {
 
 test "loope instruction: exits when ZF becomes 0" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4873,8 +5061,8 @@ test "loope instruction: exits when ZF becomes 0" {
 
 test "loopne instruction: exits when ZF becomes 1" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -4910,8 +5098,8 @@ test "loopne instruction: exits when ZF becomes 1" {
 
 test "les instruction: 32-bit far pointer" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -4942,8 +5130,8 @@ test "les instruction: 32-bit far pointer" {
 
 test "lds instruction: 32-bit far pointer" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -4974,8 +5162,8 @@ test "lds instruction: 32-bit far pointer" {
 
 test "lss instruction: 32-bit far pointer" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5007,8 +5195,8 @@ test "lss instruction: 32-bit far pointer" {
 
 test "sldt and lldt instructions" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5045,8 +5233,8 @@ test "sldt and lldt instructions" {
 
 test "str and ltr instructions" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5323,7 +5511,7 @@ test "cmpxchg8b instruction - not equal (accumulator updated)" {
 test "pushad and popad round-trip" {
     const allocator = std.testing.allocator;
 
-    var mem = try mem_mod.Memory.init(allocator, 1024 * 1024);
+    var mem = try Memory.init(allocator, 1024 * 1024);
     defer mem.deinit();
 
     var io_ctrl = io_mod.IoController.init(allocator);
@@ -5383,7 +5571,7 @@ test "pushad and popad round-trip" {
 test "pusha with 16-bit operand size" {
     const allocator = std.testing.allocator;
 
-    var mem = try mem_mod.Memory.init(allocator, 1024 * 1024);
+    var mem = try Memory.init(allocator, 1024 * 1024);
     defer mem.deinit();
 
     var io_ctrl = io_mod.IoController.init(allocator);
@@ -5436,7 +5624,7 @@ test "pusha with 16-bit operand size" {
 test "popad does not modify esp from stack" {
     const allocator = std.testing.allocator;
 
-    var mem = try mem_mod.Memory.init(allocator, 1024 * 1024);
+    var mem = try Memory.init(allocator, 1024 * 1024);
     defer mem.deinit();
 
     var io_ctrl = io_mod.IoController.init(allocator);
@@ -5473,7 +5661,7 @@ test "popad does not modify esp from stack" {
 test "bswap instruction" {
     const allocator = std.testing.allocator;
 
-    var mem = try mem_mod.Memory.init(allocator, 1024 * 1024);
+    var mem = try Memory.init(allocator, 1024 * 1024);
     defer mem.deinit();
 
     var io_ctrl = io_mod.IoController.init(allocator);
@@ -5564,8 +5752,8 @@ test "bswap instruction" {
 
 test "shld instruction: immediate count" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5603,8 +5791,8 @@ test "shld instruction: immediate count" {
 
 test "shld instruction: CL count" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5635,8 +5823,8 @@ test "shld instruction: CL count" {
 
 test "shld instruction: 16-bit operand" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5667,8 +5855,8 @@ test "shld instruction: 16-bit operand" {
 
 test "shrd instruction: immediate count" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5701,8 +5889,8 @@ test "shrd instruction: immediate count" {
 
 test "shrd instruction: CL count" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5734,8 +5922,8 @@ test "shrd instruction: CL count" {
 
 test "shrd instruction: verify carry flag" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5765,8 +5953,8 @@ test "shrd instruction: verify carry flag" {
 
 test "mov segment to register: MOV AX, DS" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5791,8 +5979,8 @@ test "mov segment to register: MOV AX, DS" {
 
 test "mov register to segment: MOV DS, AX" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5817,8 +6005,8 @@ test "mov register to segment: MOV DS, AX" {
 
 test "mov segment to memory: MOV [0x1000], ES" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5845,8 +6033,8 @@ test "mov segment to memory: MOV [0x1000], ES" {
 
 test "mov memory to segment: MOV SS, [0x2000]" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5872,8 +6060,8 @@ test "mov memory to segment: MOV SS, [0x2000]" {
 
 test "mov cs to register fails: cannot load CS with MOV" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5898,8 +6086,8 @@ test "mov cs to register fails: cannot load CS with MOV" {
 
 test "far jmp: JMP ptr16:32 in real mode" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5926,8 +6114,8 @@ test "far jmp: JMP ptr16:32 in real mode" {
 
 test "far jmp: JMP ptr16:16 in 16-bit mode" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -5955,8 +6143,8 @@ test "far jmp: JMP ptr16:16 in 16-bit mode" {
 
 test "far call and retf: round trip in real mode" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -6004,8 +6192,8 @@ test "far call and retf: round trip in real mode" {
 
 test "retf with stack cleanup: RETF imm16" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -6039,8 +6227,8 @@ test "retf with stack cleanup: RETF imm16" {
 
 test "jecxz: jump when ecx is zero" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6065,8 +6253,8 @@ test "jecxz: jump when ecx is zero" {
 
 test "jecxz: no jump when ecx is non-zero" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6091,8 +6279,8 @@ test "jecxz: no jump when ecx is non-zero" {
 
 test "jcxz: jump when cx is zero (with address size override)" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6118,8 +6306,8 @@ test "jcxz: jump when cx is zero (with address size override)" {
 
 test "imul r32, r32, imm8: basic multiplication" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6148,8 +6336,8 @@ test "imul r32, r32, imm8: basic multiplication" {
 
 test "imul r32, r32, imm8: with overflow" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6176,8 +6364,8 @@ test "imul r32, r32, imm8: with overflow" {
 
 test "imul r32, r32, imm32: basic multiplication" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6206,8 +6394,8 @@ test "imul r32, r32, imm32: basic multiplication" {
 
 test "imul r16, r16, imm16: 16-bit multiplication" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6237,8 +6425,8 @@ test "imul r16, r16, imm16: 16-bit multiplication" {
 
 test "clts: clear task-switched flag" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6263,8 +6451,8 @@ test "clts: clear task-switched flag" {
 
 test "mov debug registers: write and read" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6295,15 +6483,15 @@ test "mov debug registers: write and read" {
 
 test "mov debug registers: DR6 and DR7 power-up values" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
     var io_ctrl = io_mod.IoController.init(allocator);
     defer io_ctrl.deinit();
 
-    var cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
+    const cpu = cpu_mod.Cpu.init(&mem, &io_ctrl);
 
     // Check power-up values per Intel spec
     try std.testing.expectEqual(@as(u32, 0xFFFF0FF0), cpu.system.dr6);
@@ -6312,8 +6500,8 @@ test "mov debug registers: DR6 and DR7 power-up values" {
 
 test "mov debug registers: DR4 and DR5 aliases" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6345,8 +6533,8 @@ test "mov debug registers: DR4 and DR5 aliases" {
 
 test "clc: clear carry flag" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6368,8 +6556,8 @@ test "clc: clear carry flag" {
 
 test "stc: set carry flag" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6391,8 +6579,8 @@ test "stc: set carry flag" {
 
 test "cmc: complement carry flag" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6419,8 +6607,8 @@ test "cmc: complement carry flag" {
 
 test "multi-byte nop: 0F 1F" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6447,8 +6635,8 @@ test "multi-byte nop: 0F 1F" {
 
 test "prefetch nop: 0F 0D" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6471,8 +6659,8 @@ test "prefetch nop: 0F 0D" {
 
 test "mov test registers: obsolete no-ops" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6504,8 +6692,8 @@ test "mov test registers: obsolete no-ops" {
 }
 test "insb: input byte from UART to memory" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6540,8 +6728,8 @@ test "insb: input byte from UART to memory" {
 
 test "outsb: output byte from memory to UART" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6576,8 +6764,8 @@ test "outsb: output byte from memory to UART" {
 
 test "rep insb: input multiple bytes from UART" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6609,8 +6797,8 @@ test "rep insb: input multiple bytes from UART" {
 
 test "rep outsw: output multiple words to port" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6655,8 +6843,8 @@ test "rep outsw: output multiple words to port" {
 
 test "insw with direction flag: decrement EDI" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6682,8 +6870,8 @@ test "insw with direction flag: decrement EDI" {
 
 test "bound: index within bounds (16-bit)" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -6716,8 +6904,8 @@ test "bound: index within bounds (16-bit)" {
 
 test "bound: index out of bounds raises error (32-bit)" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -6745,8 +6933,8 @@ test "bound: index out of bounds raises error (32-bit)" {
 
 test "arpl: adjust RPL when dest < src" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -6778,8 +6966,8 @@ test "arpl: adjust RPL when dest < src" {
 
 test "arpl: no adjustment when dest >= src" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 16 * 1024);
     defer mem.deinit();
@@ -6810,8 +6998,8 @@ test "arpl: no adjustment when dest >= src" {
 
 test "xlat: table lookup translation" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6857,8 +7045,8 @@ test "xlat: table lookup translation" {
 
 test "wait: fpu wait instruction" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6882,8 +7070,8 @@ test "wait: fpu wait instruction" {
 
 test "into: interrupt on overflow when OF=1" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6912,8 +7100,8 @@ test "into: interrupt on overflow when OF=1" {
 
 test "into: no interrupt when OF=0" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
+
+
 
     var mem = try memory.Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6935,10 +7123,10 @@ test "into: no interrupt when OF=0" {
 
 test "adc instruction: 8-bit with carry" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
-    const Memory = memory.Memory;
-    const IoController = io_mod.IoController;
+
+
+
+
 
     var mem = try Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6965,10 +7153,10 @@ test "adc instruction: 8-bit with carry" {
 
 test "adc instruction: 32-bit with carry" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
-    const Memory = memory.Memory;
-    const IoController = io_mod.IoController;
+
+
+
+
 
     var mem = try Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -6995,10 +7183,10 @@ test "adc instruction: 32-bit with carry" {
 
 test "sbb instruction: 8-bit with borrow" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
-    const Memory = memory.Memory;
-    const IoController = io_mod.IoController;
+
+
+
+
 
     var mem = try Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -7024,10 +7212,10 @@ test "sbb instruction: 8-bit with borrow" {
 
 test "sbb instruction: 32-bit underflow with borrow" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
-    const Memory = memory.Memory;
-    const IoController = io_mod.IoController;
+
+
+
+
 
     var mem = try Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -7053,10 +7241,10 @@ test "sbb instruction: 32-bit underflow with borrow" {
 
 test "daa instruction: after addition" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
-    const Memory = memory.Memory;
-    const IoController = io_mod.IoController;
+
+
+
+
 
     var mem = try Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -7082,10 +7270,10 @@ test "daa instruction: after addition" {
 
 test "daa instruction: with carry" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
-    const Memory = memory.Memory;
-    const IoController = io_mod.IoController;
+
+
+
+
 
     var mem = try Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -7111,10 +7299,10 @@ test "daa instruction: with carry" {
 
 test "das instruction: after subtraction" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
-    const Memory = memory.Memory;
-    const IoController = io_mod.IoController;
+
+
+
+
 
     var mem = try Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -7139,10 +7327,10 @@ test "das instruction: after subtraction" {
 
 test "aaa instruction: adjust after addition" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
-    const Memory = memory.Memory;
-    const IoController = io_mod.IoController;
+
+
+
+
 
     var mem = try Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -7168,10 +7356,10 @@ test "aaa instruction: adjust after addition" {
 
 test "aaa instruction: no adjustment needed" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
-    const Memory = memory.Memory;
-    const IoController = io_mod.IoController;
+
+
+
+
 
     var mem = try Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -7196,10 +7384,10 @@ test "aaa instruction: no adjustment needed" {
 
 test "aas instruction: adjust after subtraction" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
-    const Memory = memory.Memory;
-    const IoController = io_mod.IoController;
+
+
+
+
 
     var mem = try Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -7224,10 +7412,10 @@ test "aas instruction: adjust after subtraction" {
 
 test "aam instruction: basic operation" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
-    const Memory = memory.Memory;
-    const IoController = io_mod.IoController;
+
+
+
+
 
     var mem = try Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -7253,10 +7441,10 @@ test "aam instruction: basic operation" {
 
 test "aam instruction: with different base" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
-    const Memory = memory.Memory;
-    const IoController = io_mod.IoController;
+
+
+
+
 
     var mem = try Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -7282,10 +7470,10 @@ test "aam instruction: with different base" {
 
 test "aad instruction: basic operation" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
-    const Memory = memory.Memory;
-    const IoController = io_mod.IoController;
+
+
+
+
 
     var mem = try Memory.init(allocator, 1024);
     defer mem.deinit();
@@ -7311,10 +7499,10 @@ test "aad instruction: basic operation" {
 
 test "aad instruction: with different base" {
     const allocator = std.testing.allocator;
-    const memory = @import("../memory/memory.zig");
-    const io_mod = @import("../io/io.zig");
-    const Memory = memory.Memory;
-    const IoController = io_mod.IoController;
+
+
+
+
 
     var mem = try Memory.init(allocator, 1024);
     defer mem.deinit();

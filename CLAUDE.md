@@ -537,7 +537,7 @@ The long-term goal is running Linux kernel self-tests. Current progress:
 | PIC/PIT | ✓ Done | 8259 interrupt controller, 8254 timer |
 | Event system | ✓ Done | Async queue + epoll event loop |
 | FPU stubs | ✓ Done | WAIT, ESC opcodes (no full FPU) |
-| Linux boot | ☐ TODO | Test with actual kernel image |
+| Linux boot | ⚡ WIP | CLI ready, needs testing with real kernel |
 
 ### Protected Mode Support
 

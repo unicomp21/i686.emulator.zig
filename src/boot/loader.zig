@@ -150,7 +150,7 @@ pub const DirectBoot = struct {
         return boot;
     }
 
-    /// Set initrd/initramfs image
+    /// Set initrd/initramfs image from file path
     pub fn setInitrd(self: *Self, initrd_path: []const u8) !void {
         const initrd_file = try std.fs.cwd().openFile(initrd_path, .{});
         defer initrd_file.close();
@@ -161,6 +161,17 @@ pub const DirectBoot = struct {
             self.allocator.free(old_data);
         }
         self.initrd_data = initrd_data;
+    }
+
+    /// Set initrd/initramfs image from memory (caller retains ownership)
+    pub fn setInitrdFromMemory(self: *Self, data: []const u8) !void {
+        // Make a copy since DirectBoot owns the initrd data
+        const initrd_copy = try self.allocator.dupe(u8, data);
+
+        if (self.initrd_data) |old_data| {
+            self.allocator.free(old_data);
+        }
+        self.initrd_data = initrd_copy;
     }
 
     /// Parse boot header from kernel image

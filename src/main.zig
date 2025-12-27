@@ -87,7 +87,7 @@ pub fn main() !void {
     const parsed_args = try parseArgs(allocator);
 
     // Configure emulator
-    var config = Config{
+    const config = Config{
         .memory_size = parsed_args.memory_mb * 1024 * 1024,
         .enable_uart = true,
         .debug_mode = parsed_args.debug,
@@ -120,15 +120,12 @@ pub fn main() !void {
             initrd_data = try initrd_file.readToEndAlloc(allocator, 16 * 1024 * 1024);
         }
 
-        // TODO: Implement loadKernel() method in Emulator
-        // For now, show a message that this feature is not yet implemented
-        std.debug.print("\nDirect kernel boot is not yet implemented.\n", .{});
-        std.debug.print("The --kernel option is available but requires implementation of:\n", .{});
-        std.debug.print("  - Linux boot protocol (bzImage parsing)\n", .{});
-        std.debug.print("  - Real mode setup (boot params, e820 map)\n", .{});
-        std.debug.print("  - Protected mode kernel entry\n", .{});
-        std.debug.print("\nSee CLAUDE.md for roadmap details.\n", .{});
-        return;
+        // Load kernel using Linux boot protocol (with optional initrd)
+        try emu.loadKernelWithInitrd(kernel_data, parsed_args.cmdline, initrd_data);
+        std.debug.print("Loaded kernel ({d} bytes) with cmdline: {s}\n", .{ kernel_data.len, parsed_args.cmdline });
+        if (initrd_data) |initrd| {
+            std.debug.print("Loaded initrd ({d} bytes)\n", .{initrd.len});
+        }
     } else if (parsed_args.binary_path) |binary_path| {
         // Raw binary boot mode (existing behavior)
         const file = try std.fs.cwd().openFile(binary_path, .{});

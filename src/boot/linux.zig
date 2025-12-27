@@ -19,7 +19,7 @@ pub const E820Type = enum(u32) {
 };
 
 /// E820 memory map entry (BIOS memory map)
-pub const E820Entry = extern struct {
+pub const E820Entry = packed struct {
     addr: u64,
     size: u64,
     type: u32,
@@ -36,7 +36,7 @@ pub const E820Entry = extern struct {
 
 /// Linux boot protocol setup header (at offset 0x1F1 in bzImage)
 /// All multi-byte fields are little-endian
-pub const SetupHeader = extern struct {
+pub const SetupHeader = packed struct {
     setup_sects: u8, // 0x1F1: Number of setup sectors (512 bytes each)
     root_flags: u16, // 0x1F2: Root filesystem flags (obsolete)
     syssize: u32, // 0x1F4: Size of protected-mode code in 16-byte paragraphs
